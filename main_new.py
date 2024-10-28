@@ -16,12 +16,13 @@ load_dotenv()
 
 class Config:
     CHECK_NEW_CLIENT = 0.5  # Similarity threshold for clients
-    EMPLOYEE_SIMILARITY_THRESHOLD = 0.6  # Similarity threshold for employees
-    MIN_DETECTION_CONFIDENCE = 0.65  # Minimum confidence for face detection
+    EMPLOYEE_SIMILARITY_THRESHOLD = 0.5  # Similarity threshold for employees
+    MIN_DETECTION_CONFIDENCE = 0.6 # Minimum detection confidence for faces
     DET_SCORE_THRESH = 0.65
     POSE_THRESHOLD = 40
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = 512
+    DET_SIZE = (640, 640)
 
 
 class Database:
@@ -41,7 +42,7 @@ class Database:
         for client in all_clients:
             client_embedding = np.array(client['embedding'])
             similarity = compute_sim(client_embedding, embedding)
-            if similarity > Config.CHECK_NEW_CLIENT and similarity > highest_similarity:
+            if similarity is not None and similarity > Config.CHECK_NEW_CLIENT and similarity > highest_similarity:
                 highest_similarity = similarity
                 best_match = client
 
@@ -58,7 +59,6 @@ class Database:
         }
         self.attendance.insert_one(attendance_data)
         Config.logger.info(f"Attendance saved for person {person_id}")
-
 
     def save_employee(self, person_id, image_data, embedding):
         # Remove existing employee data if any
@@ -119,18 +119,16 @@ class Database:
 
 class FaceProcessor:
     def __init__(self):
-        self.app = FaceAnalysis()
-        self.app.prepare(ctx_id=0)
+        # Initialize FaceAnalysis with desired models
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        self.app.prepare(ctx_id=0, det_size=(640, 640))
 
-    def process_image(self, image_data):
-        nparr = np.frombuffer(image_data, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if image is None:
-            Config.logger.error("Failed to decode image")
-            return []
+    def process_image(self, image):
         faces = self.app.get(image)
+        Config.logger.debug(f"Total faces detected before filtering: {len(faces)}")
         # Filter faces based on detection confidence
         faces = [face for face in faces if face.det_score >= Config.MIN_DETECTION_CONFIDENCE]
+        Config.logger.debug(f"Faces after filtering: {len(faces)}")
         return faces
 
 
@@ -154,7 +152,7 @@ class MainRunner:
         for employee in all_employees:
             employee_embedding = np.array(employee['embedding'])
             similarity = compute_sim(employee_embedding, face_data.embedding)
-            if similarity > highest_similarity:
+            if similarity is not None and similarity > highest_similarity:
                 highest_similarity = similarity
                 best_match_employee = employee
 
@@ -194,18 +192,28 @@ class MainRunner:
             )
             Config.logger.info(f"Saved new client with ID {new_id}")
 
+
     def process_image_file(self, file_path, camera_id):
         try:
-            with open(file_path, 'rb') as f:
-                image_data = f.read()
+            image = cv2.imread(file_path)
+            if image is None:
+                Config.logger.error(f"Failed to read image from {file_path}")
+                return
 
-            faces = self.face_processor.process_image(image_data)
+            # Convert from BGR to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            Config.logger.debug(f"Image shape: {image.shape}")
+
+            # Resize image to standard size
+            image = cv2.resize(image, (640, 480))
+
+            faces = self.face_processor.process_image(image)
             Config.logger.info(f"Processing file: {file_path}, Faces detected: {len(faces)}")
             if not faces:
                 Config.logger.error(f"No faces found in the image: {file_path}")
                 return
 
-            face_data = get_faces_data(faces)
+            face_data = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
             if not face_data:
                 Config.logger.error(f"Could not extract face data from image: {file_path}")
                 return
@@ -215,6 +223,10 @@ class MainRunner:
                 Config.logger.error(f"Could not extract date from filename: {file_path}")
                 return
 
+            # Read image data as bytes
+            with open(file_path, 'rb') as f:
+                image_data = f.read()
+
             self.process_faces(face_data, image_data, camera_id, date)
 
         except Exception as e:
@@ -223,22 +235,25 @@ class MainRunner:
             # Clean up the processed file
             if os.path.exists(file_path):
                 os.remove(file_path)
+            # Remove corresponding BACKGROUND file if it exists
             bg_file = file_path.replace('SNAP', 'BACKGROUND')
             if os.path.exists(bg_file):
                 os.remove(bg_file)
 
     def run(self):
+        Config.logger.info(f"Checking directory: {self.images_folder}")
         while True:
+
             try:
                 # Process only test_camera directory
                 camera_dir = os.path.join(self.images_folder, 'test_camera')
-                Config.logger.info(f"Checking directory: {camera_dir}")
+
                 if not os.path.exists(camera_dir):
                     time.sleep(1)
                     continue
 
                 for file in os.listdir(camera_dir):
-                    if file.endswith('BACKGROUND.jpg'):
+                    if file.endswith('SNAP.jpg'):
                         file_path = os.path.join(camera_dir, file)
                         self.process_image_file(file_path, 1)  # Using camera_id = 1
 
@@ -248,16 +263,26 @@ class MainRunner:
 
     def add_employee(self, image_path, person_id):
         try:
-            with open(image_path, 'rb') as f:
-                image_data = f.read()
+            image = cv2.imread(image_path)
+            if image is None:
+                raise ValueError("Failed to read image")
 
-            faces = self.face_processor.process_image(image_data)
+            # Convert from BGR to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Resize image to standard size
+            image = cv2.resize(image, (640, 480))
+
+            faces = self.face_processor.process_image(image)
             if not faces:
                 raise ValueError("No face detected in the image")
 
-            face_data = get_faces_data(faces)
+            face_data = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
             if not face_data:
                 raise ValueError("Could not process face data")
+
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
 
             self.db.save_employee(person_id, image_data, face_data.embedding)
             return True

@@ -17,7 +17,7 @@ def setup_logger(name, log_file, level=logging.DEBUG):
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)  # Set to DEBUG to capture detailed logs
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
@@ -50,16 +50,17 @@ def copy_files(file1, file2, dirname):
         logger.error(f"Error copying files: {e}")
 
 
-def get_faces_data(faces):
+def get_faces_data(faces, min_confidence):
     """Return face data with maximum rectangle area."""
     if not faces:
         return None
     # Filter out faces with low confidence scores
-    faces = [face for face in faces if face.det_score >= 0.65]
+    faces = [face for face in faces if face.det_score >= min_confidence]
     if not faces:
         return None
     # Return the face with the largest bounding box area
     return max(faces, key=lambda face: calculate_rectangle_area(face.bbox))
+
 
 
 def calculate_rectangle_area(bbox):
@@ -74,6 +75,10 @@ def compute_sim(feat1, feat2, logger=logger):
     try:
         feat1 = feat1.ravel()
         feat2 = feat2.ravel()
+        logger.debug(f"compute_sim: feat1 shape: {feat1.shape}, feat2 shape: {feat2.shape}")
+        if feat1.shape != (512,) or feat2.shape != (512,):
+            logger.error(f"Embeddings have incorrect shapes: feat1.shape={feat1.shape}, feat2.shape={feat2.shape}")
+            return None
         sim = np.dot(feat1, feat2) / (norm(feat1) * norm(feat2))
         return sim
     except Exception as e:

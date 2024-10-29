@@ -5,9 +5,10 @@ import shutil
 from datetime import datetime
 import numpy as np
 from numpy.linalg import norm
+from functools import lru_cache
 
 
-def setup_logger(name, log_file, level=logging.DEBUG):
+def setup_logger(name, log_file, level=logging.INFO):
     """Setup and create logger with given parameters."""
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
@@ -17,18 +18,19 @@ def setup_logger(name, log_file, level=logging.DEBUG):
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.DEBUG)  # Set to DEBUG to capture detailed logs
+    console_handler.setLevel(level)  # Changed to INFO
 
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    logger.setLevel(level)
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
 
     return logger
 
 
 os.makedirs('logs', exist_ok=True)
-logger = setup_logger("flog", "logs/flog.log")
+logger = setup_logger("flog", "logs/flog.log", level=logging.INFO)  # Changed to INFO
 
 
 def extract_date_from_filename(filename):
@@ -70,12 +72,12 @@ def calculate_rectangle_area(bbox):
     return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
 
-def compute_sim(feat1, feat2, logger=logger):
+@lru_cache(maxsize=128)
+def compute_sim(feat1_tuple, feat2_tuple):
     """Compute similarity between two feature vectors."""
     try:
-        feat1 = feat1.ravel()
-        feat2 = feat2.ravel()
-        logger.debug(f"compute_sim: feat1 shape: {feat1.shape}, feat2 shape: {feat2.shape}")
+        feat1 = np.array(feat1_tuple).astype('float32').ravel()
+        feat2 = np.array(feat2_tuple).astype('float32').ravel()
         if feat1.shape != (512,) or feat2.shape != (512,):
             logger.error(f"Embeddings have incorrect shapes: feat1.shape={feat1.shape}, feat2.shape={feat2.shape}")
             return None

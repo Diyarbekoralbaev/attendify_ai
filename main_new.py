@@ -2,38 +2,39 @@
 import os
 import threading
 import time
-from datetime import datetime
 import cv2
 import numpy as np
 from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 from pymongo import MongoClient
-from bson.binary import Binary
 import requests
 from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
+import faiss
+import cProfile
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from tasks import process_image_task
 
 load_dotenv()
 
 
 class Config:
-    CHECK_NEW_CLIENT = 0.5  # Similarity threshold for clients
-    EMPLOYEE_SIMILARITY_THRESHOLD = 0.5  # Similarity threshold for employees
-    MIN_DETECTION_CONFIDENCE = 0.6  # Minimum detection confidence for faces
-    DET_SCORE_THRESH = 0.65
-    POSE_THRESHOLD = 40
+    CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.5))  # Similarity threshold for clients
+    EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.5))  # Similarity threshold for employees
+    MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))  # Minimum detection confidence for faces
+    DET_SCORE_THRESH = float(os.getenv('DET_SCORE_THRESH', 0.65))
+    POSE_THRESHOLD = float(os.getenv('POSE_THRESHOLD', 40))
     logger = setup_logger('MainRunner', 'logs/main.log')
-    DIMENSIONS = 512
-    DET_SIZE = (640, 640)
+    DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
+    DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
     API_BASE_URL = os.getenv('API_BASE_URL', 'http://10.30.10.136:8000')
-    HEADERS = {
-        'Authorization': f'Bearer {os.getenv("API_TOKEN")}'  # If authentication is required
-    }
 
 
 def send_report(endpoint, data, files=None):
     url = f"{Config.API_BASE_URL}{endpoint}"
     try:
-        response = requests.post(url, data=data, files=files, headers=Config.HEADERS)
+        response = requests.post(url, data=data, files=files)
         response.raise_for_status()
         Config.logger.info(f"Successfully sent report to {endpoint}")
     except requests.RequestException as e:
@@ -48,35 +49,41 @@ class Database:
         self.clients = self.db.clients
         self.attendance = self.db.attendance
 
+        # Initialize Faiss index for employees
+        self.employee_embeddings = [np.array(emp['embedding']) for emp in self.employees.find({"embedding": {"$exists": True}})]
+        if self.employee_embeddings:
+            self.employee_index = faiss.IndexFlatL2(Config.DIMENSIONS)
+            self.employee_index.add(np.array(self.employee_embeddings).astype('float32'))
+        else:
+            self.employee_index = None
+
+        # Similarly, initialize Faiss index for clients
+        self.client_embeddings = [np.array(cli['embedding']) for cli in self.clients.find({"embedding": {"$exists": True}})]
+        if self.client_embeddings:
+            self.client_index = faiss.IndexFlatL2(Config.DIMENSIONS)
+            self.client_index.add(np.array(self.client_embeddings).astype('float32'))
+        else:
+            self.client_index = None
+
     def find_matching_employee(self, embedding):
-        """Find existing employee with closest matching face embedding"""
-        all_employees = list(self.employees.find({"embedding": {"$exists": True}}))
-        best_match = None
-        highest_similarity = 0
-
-        for employee in all_employees:
-            employee_embedding = np.array(employee['embedding'])
-            similarity = compute_sim(employee_embedding, embedding)
-            if similarity is not None and similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD and similarity > highest_similarity:
-                highest_similarity = similarity
-                best_match = employee
-
-        return best_match, highest_similarity
+        if not self.employee_index:
+            return None, 0
+        D, I = self.employee_index.search(np.array([embedding]).astype('float32'), k=1)
+        similarity = 1 - D[0][0] / (2 * Config.DIMENSIONS)  # Example similarity metric
+        if similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
+            employee = self.employees.find_one({"embedding": self.employee_embeddings[I[0][0]].tolist()})
+            return employee, similarity
+        return None, 0
 
     def find_matching_client(self, embedding):
-        """Find existing client with closest matching face embedding"""
-        all_clients = list(self.clients.find({"embedding": {"$exists": True}}))
-        best_match = None
-        highest_similarity = 0
-
-        for client in all_clients:
-            client_embedding = np.array(client['embedding'])
-            similarity = compute_sim(client_embedding, embedding)
-            if similarity is not None and similarity > Config.CHECK_NEW_CLIENT and similarity > highest_similarity:
-                highest_similarity = similarity
-                best_match = client
-
-        return best_match, highest_similarity
+        if not self.client_index:
+            return None, 0
+        D, I = self.client_index.search(np.array([embedding]).astype('float32'), k=1)
+        similarity = 1 - D[0][0] / (2 * Config.DIMENSIONS)  # Example similarity metric
+        if similarity > Config.CHECK_NEW_CLIENT:
+            client = self.clients.find_one({"embedding": self.client_embeddings[I[0][0]].tolist()})
+            return client, similarity
+        return None, 0
 
     def save_attendance_to_api(self, person_id, device_id, image_url, timestamp, score):
         """Send attendance data to FastAPI API"""
@@ -155,6 +162,7 @@ class MainRunner:
         self.db = Database()
         self.face_processor = FaceProcessor()
         self.lock = threading.Lock()
+        self.logger = Config.logger
 
     def process_faces(self, face_data, image_url, camera_id, timestamp):
         embedding = face_data.embedding
@@ -210,9 +218,10 @@ class MainRunner:
             Config.logger.debug(f"Image shape: {image.shape}")
 
             # Resize image to standard size
-            image = cv2.resize(image, (640, 480))
+            image_resized = cv2.resize(image, Config.DET_SIZE)
 
-            faces = self.face_processor.process_image(image)
+            faces = self.face_processor.process_image(image_resized)
+
             Config.logger.info(f"Processing file: {file_path}, Faces detected: {len(faces)}")
             if not faces:
                 Config.logger.error(f"No faces found in the image: {file_path}")
@@ -245,24 +254,20 @@ class MainRunner:
                 os.remove(bg_file)
 
     def run(self):
-        Config.logger.info(f"Checking directory: {self.images_folder}")
-        while True:
-            try:
-                # Process only test_camera directory
-                camera_dir = os.path.join(self.images_folder, 'test_camera')
-
-                if not os.path.exists(camera_dir):
-                    time.sleep(1)
-                    continue
-
-                for file in os.listdir(camera_dir):
-                    if file.endswith('SNAP.jpg'):
-                        file_path = os.path.join(camera_dir, file)
-                        self.process_image_file(file_path, 1)  # Using camera_id = 1
-
-            except Exception as e:
-                Config.logger.error(f'Exception in main run: {e}')
-            time.sleep(1)
+        self.logger.info(f"Starting directory observer for: {self.images_folder}")
+        event_handler = ImageHandler(self.logger)
+        observer = Observer()
+        test_camera_dir = os.path.join(self.images_folder, 'test_camera')
+        os.makedirs(test_camera_dir, exist_ok=True)
+        observer.schedule(event_handler, path=test_camera_dir, recursive=False)
+        observer.start()
+        try:
+            while True:
+                time.sleep(10)  # Sleep longer since Watchdog handles events
+        except KeyboardInterrupt:
+            self.logger.info("Stopping directory observer.")
+            observer.stop()
+        observer.join()
 
     def add_employee(self, image_path, person_id):
         try:
@@ -299,7 +304,6 @@ class MainRunner:
                 f"{Config.API_BASE_URL}/employee/create",
                 data=data,
                 files=files,
-                headers=Config.HEADERS
             )
             response.raise_for_status()
             Config.logger.info(f"Employee created via API with ID: {person_id}")
@@ -309,8 +313,23 @@ class MainRunner:
             return False
 
 
+class ImageHandler(FileSystemEventHandler):
+    def __init__(self, logger):
+        super().__init__()
+        self.logger = logger
+
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.endswith('SNAP.jpg'):
+            self.logger.info(f"New image detected: {event.src_path}")
+            # Dispatch a Celery task to process the image
+            process_image_task.delay(event.src_path, camera_id=1)
+
 if __name__ == '__main__':
     load_dotenv()
     images_folder = os.getenv('IMAGES_FOLDER', '/path/to/images')
     runner = MainRunner(images_folder)
+    profiler = cProfile.Profile()
+    profiler.enable()
     runner.run()
+    profiler.disable()
+    profiler.dump_stats("main_profiler.stats")

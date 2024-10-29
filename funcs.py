@@ -34,6 +34,7 @@ logger = setup_logger("flog", "logs/flog.log")
 def extract_date_from_filename(filename):
     """Extract date from filename."""
     try:
+        # Adjust the split index and format based on your filename pattern
         date_str = filename.split("_")[2]
         return datetime.strptime(date_str, "%Y%m%d%H%M%S%f")
     except Exception as e:
@@ -60,7 +61,6 @@ def get_faces_data(faces, min_confidence):
         return None
     # Return the face with the largest bounding box area
     return max(faces, key=lambda face: calculate_rectangle_area(face.bbox))
-
 
 
 def calculate_rectangle_area(bbox):

@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 from pymongo import MongoClient
 from bson.binary import Binary
+import requests
 from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
 
 load_dotenv()
@@ -17,25 +18,54 @@ load_dotenv()
 class Config:
     CHECK_NEW_CLIENT = 0.5  # Similarity threshold for clients
     EMPLOYEE_SIMILARITY_THRESHOLD = 0.5  # Similarity threshold for employees
-    MIN_DETECTION_CONFIDENCE = 0.6 # Minimum detection confidence for faces
+    MIN_DETECTION_CONFIDENCE = 0.6  # Minimum detection confidence for faces
     DET_SCORE_THRESH = 0.65
     POSE_THRESHOLD = 40
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = 512
     DET_SIZE = (640, 640)
+    API_BASE_URL = os.getenv('API_BASE_URL', 'http://10.30.10.136:8000')
+    HEADERS = {
+        'Authorization': f'Bearer {os.getenv("API_TOKEN")}'  # If authentication is required
+    }
+
+
+def send_report(endpoint, data, files=None):
+    url = f"{Config.API_BASE_URL}{endpoint}"
+    try:
+        response = requests.post(url, data=data, files=files, headers=Config.HEADERS)
+        response.raise_for_status()
+        Config.logger.info(f"Successfully sent report to {endpoint}")
+    except requests.RequestException as e:
+        Config.logger.error(f"Failed to send report to {endpoint}: {e}")
 
 
 class Database:
     def __init__(self):
         self.client = MongoClient(os.getenv('MONGODB_LOCAL'))
-        self.db = self.client.empl_time
+        self.db = self.client.empl_time_fastapi
         self.employees = self.db.employees
         self.clients = self.db.clients
         self.attendance = self.db.attendance
 
+    def find_matching_employee(self, embedding):
+        """Find existing employee with closest matching face embedding"""
+        all_employees = list(self.employees.find({"embedding": {"$exists": True}}))
+        best_match = None
+        highest_similarity = 0
+
+        for employee in all_employees:
+            employee_embedding = np.array(employee['embedding'])
+            similarity = compute_sim(employee_embedding, embedding)
+            if similarity is not None and similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD and similarity > highest_similarity:
+                highest_similarity = similarity
+                best_match = employee
+
+        return best_match, highest_similarity
+
     def find_matching_client(self, embedding):
         """Find existing client with closest matching face embedding"""
-        all_clients = self.clients.find({"embedding": {"$exists": True}})
+        all_clients = list(self.clients.find({"embedding": {"$exists": True}}))
         best_match = None
         highest_similarity = 0
 
@@ -48,73 +78,60 @@ class Database:
 
         return best_match, highest_similarity
 
-    def save_attendance(self, person_id, camera_id, image_data, timestamp, score):
-        attendance_data = {
-            "user_id": person_id,
-            "device_id": camera_id,
-            "image": Binary(image_data),
-            "timestamp": timestamp,
-            "score": float(score),  # Convert to Python float
-            "created_at": datetime.now()
+    def save_attendance_to_api(self, person_id, device_id, image_url, timestamp, score):
+        """Send attendance data to FastAPI API"""
+        endpoint = "/attendance/create"  # Adjust as per actual API endpoint
+        data = {
+            'employee_id': person_id,
+            'device_id': device_id,
+            'timestamp': timestamp,
+            'score': score
         }
-        self.attendance.insert_one(attendance_data)
-        Config.logger.info(f"Attendance saved for person {person_id}")
-
-    def save_employee(self, person_id, image_data, embedding):
-        # Remove existing employee data if any
-        self.employees.delete_many({"person_id": person_id})
-
-        employee_data = {
-            "person_id": person_id,
-            "image": Binary(image_data),
-            "embedding": embedding.tolist(),
-            "created_at": datetime.now()
-        }
-        self.employees.insert_one(employee_data)
-        Config.logger.info(f"Employee saved with ID: {person_id}")
-
-    def update_client(self, client_id, image_data, embedding, face_data):
-        """Update existing client with new visit data"""
-        update_data = {
-            "$set": {
-                "last_visit": datetime.now(),
-                "image": Binary(image_data),
-                "embedding": embedding.tolist(),
-                "gender": int(face_data.gender),
-                "age": int(face_data.age),
-            },
-            "$inc": {
-                "visit_count": 1
-            },
-            "$push": {
-                "visit_history": {
-                    "timestamp": datetime.now(),
-                    "image": Binary(image_data)
-                }
+        try:
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
+            files = {
+                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
             }
-        }
-        self.clients.update_one({"person_id": client_id}, update_data)
-        Config.logger.info(f"Client {client_id} visit count updated")
+            send_report(endpoint, data, files)
+        except Exception as e:
+            Config.logger.error(f"Error sending attendance to API: {e}")
 
-    def save_client(self, person_id, image_data, embedding, face_data):
-        """Save new client with initial visit data"""
-        client_data = {
-            "person_id": person_id,
-            "image": Binary(image_data),
-            "embedding": embedding.tolist(),
-            "gender": int(face_data.gender),
-            "age": int(face_data.age),
-            "first_visit": datetime.now(),
-            "last_visit": datetime.now(),
-            "visit_count": 1,
-            "visit_history": [{
-                "timestamp": datetime.now(),
-                "image": Binary(image_data)
-            }],
-            "created_at": datetime.now()
+    def update_client_via_api(self, client_id, image_url, timestamp, device_id):
+        """Send client visit data to FastAPI API"""
+        endpoint = f"/client/visit-history/{client_id}"
+        data = {
+            'datetime': timestamp,
+            'device_id': device_id
         }
-        self.clients.insert_one(client_data)
-        Config.logger.info(f"New client saved with ID: {person_id}")
+        try:
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
+            files = {
+                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
+            }
+            send_report(endpoint, data, files)
+        except Exception as e:
+            Config.logger.error(f"Error updating client visit via API: {e}")
+
+    def create_client_via_api(self, image_url, first_seen, last_seen, gender, age):
+        """Create a new client via FastAPI API"""
+        endpoint = "/client/create"
+        data = {
+            'first_seen': first_seen,
+            'last_seen': last_seen,
+            'gender': gender,
+            'age': age
+        }
+        try:
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
+            files = {
+                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
+            }
+            send_report(endpoint, data, files)
+        except Exception as e:
+            Config.logger.error(f"Error creating new client via API: {e}")
 
 
 class FaceProcessor:
@@ -139,59 +156,47 @@ class MainRunner:
         self.face_processor = FaceProcessor()
         self.lock = threading.Lock()
 
-    def process_faces(self, face_data, image_data, camera_id, date):
-        # Fetch all employees with embeddings
-        all_employees = list(self.db.employees.find({
-            "embedding": {"$exists": True}
-        }))
+    def process_faces(self, face_data, image_url, camera_id, timestamp):
+        embedding = face_data.embedding
 
-        best_match_employee = None
-        highest_similarity = 0
+        # Check against employees
+        best_match_employee, similarity_employee = self.db.find_matching_employee(embedding)
 
-        # Compare face embedding with each employee embedding
-        for employee in all_employees:
-            employee_embedding = np.array(employee['embedding'])
-            similarity = compute_sim(employee_embedding, face_data.embedding)
-            if similarity is not None and similarity > highest_similarity:
-                highest_similarity = similarity
-                best_match_employee = employee
-
-        # Check if similarity exceeds the threshold
-        if highest_similarity >= Config.EMPLOYEE_SIMILARITY_THRESHOLD:
-            # Employee recognized
-            self.db.save_attendance(
-                best_match_employee['person_id'],
-                camera_id,
-                image_data,
-                date.strftime("%Y-%m-%d %H:%M:%S"),
-                face_data.det_score
+        if best_match_employee:
+            # Employee recognized; send attendance to API
+            self.db.save_attendance_to_api(
+                person_id=best_match_employee['person_id'],
+                device_id=camera_id,
+                image_url=image_url,
+                timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                score=face_data.det_score
             )
-            Config.logger.info(f"Attendance saved for employee {best_match_employee['person_id']} with similarity {highest_similarity}")
+            Config.logger.info(f"Attendance sent for employee {best_match_employee['person_id']} with similarity {similarity_employee}")
             return
 
         # Check against clients
-        matching_client, similarity = self.db.find_matching_client(face_data.embedding)
+        matching_client, similarity_client = self.db.find_matching_client(embedding)
 
         if matching_client:
-            # Update existing client's visit data
-            self.db.update_client(
-                matching_client['person_id'],
-                image_data,
-                face_data.embedding,
-                face_data
+            # Existing client; send visit update to API
+            self.db.update_client_via_api(
+                client_id=matching_client['person_id'],
+                image_url=image_url,
+                timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                device_id=camera_id
             )
-            Config.logger.info(f"Updated existing client {matching_client['person_id']} with similarity {similarity}")
+            Config.logger.info(f"Client {matching_client['person_id']} visit updated with similarity {similarity_client}")
         else:
-            # Add as new client
-            new_id = self.db.clients.count_documents({}) + 1
-            self.db.save_client(
-                new_id,
-                image_data,
-                face_data.embedding,
-                face_data
+            # New client; create via API
+            # For the purpose of this example, assuming gender and age can be extracted from face_data
+            self.db.create_client_via_api(
+                image_url=image_url,
+                first_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                last_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                gender=int(face_data.gender),
+                age=int(face_data.age)
             )
-            Config.logger.info(f"Saved new client with ID {new_id}")
-
+            Config.logger.info(f"New client created from image {image_url}")
 
     def process_image_file(self, file_path, camera_id):
         try:
@@ -218,16 +223,15 @@ class MainRunner:
                 Config.logger.error(f"Could not extract face data from image: {file_path}")
                 return
 
-            date = extract_date_from_filename(os.path.basename(file_path))
-            if not date:
+            timestamp = extract_date_from_filename(os.path.basename(file_path))
+            if not timestamp:
                 Config.logger.error(f"Could not extract date from filename: {file_path}")
                 return
 
-            # Read image data as bytes
-            with open(file_path, 'rb') as f:
-                image_data = f.read()
+            # Construct image URL based on known pattern
+            image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(file_path)}"
 
-            self.process_faces(face_data, image_data, camera_id, date)
+            self.process_faces(face_data, image_url, camera_id, timestamp)
 
         except Exception as e:
             Config.logger.error(f"Error processing image {file_path}: {e}")
@@ -243,7 +247,6 @@ class MainRunner:
     def run(self):
         Config.logger.info(f"Checking directory: {self.images_folder}")
         while True:
-
             try:
                 # Process only test_camera directory
                 camera_dir = os.path.join(self.images_folder, 'test_camera')
@@ -281,10 +284,25 @@ class MainRunner:
             if not face_data:
                 raise ValueError("Could not process face data")
 
-            with open(image_path, 'rb') as f:
-                image_data = f.read()
-
-            self.db.save_employee(person_id, image_data, face_data.embedding)
+            # Instead of saving to MongoDB, send to API
+            image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(image_path)}"
+            data = {
+                'name': 'Employee Name',  # Replace with actual data
+                'email': 'employee@example.com',  # Replace with actual data
+                'phone': '1234567890',  # Replace with actual data
+                'department_id': 1  # Replace with actual data
+            }
+            files = {
+                'image': (os.path.basename(image_path), open(image_path, 'rb'), 'image/jpeg')
+            }
+            response = requests.post(
+                f"{Config.API_BASE_URL}/employee/create",
+                data=data,
+                files=files,
+                headers=Config.HEADERS
+            )
+            response.raise_for_status()
+            Config.logger.info(f"Employee created via API with ID: {person_id}")
             return True
         except Exception as e:
             Config.logger.error(f"Error adding employee: {e}")
@@ -292,5 +310,7 @@ class MainRunner:
 
 
 if __name__ == '__main__':
-    runner = MainRunner(os.getenv('IMAGES_FOLDER'))
+    load_dotenv()
+    images_folder = os.getenv('IMAGES_FOLDER', '/path/to/images')
+    runner = MainRunner(images_folder)
     runner.run()

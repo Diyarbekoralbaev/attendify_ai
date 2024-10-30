@@ -116,6 +116,8 @@ def fetch_and_store_data():
         employees_response.raise_for_status()
         employees = employees_response.json()
 
+        fetched_employee_ids = [emp['id'] for emp in employees]
+
         # Process and store employee embeddings
         for employee in employees:
             image_url = f"{API_BASE_URL}/{employee['image']}"
@@ -140,17 +142,24 @@ def fetch_and_store_data():
             else:
                 logger.error(f"Failed to get embedding for Employee ID: {employee['id']}")
 
-        # # Remove deleted employees from MongoDB
-        # for emp in employees_collection.find({"person_id": {"$nin": [emp['id'] for emp in employees]}}):
-        #     employees_collection.delete_one({"_id": emp["_id"]})
-        #     faiss_index_employee.remove_ids(np.array([emp["person_id"]]))
-        #     employee_ids.remove(emp["person_id"])
-        #     logger.info(f"Removed deleted employee ID: {emp['person_id']}")
+        deleted_employees = employees_collection.find({"person_id": {"$nin": fetched_employee_ids}})
+        deleted_employee_ids = [emp['person_id'] for emp in deleted_employees]
+
+        if deleted_employee_ids:
+            try:
+                employees_collection.delete_many({"person_id": {"$in": deleted_employee_ids}})
+                faiss_index_employee.remove_ids(np.array(deleted_employee_ids))
+                employee_ids = [emp_id for emp_id in employee_ids if emp_id not in deleted_employee_ids]
+                logger.info(f"Removed deleted employees: {deleted_employee_ids}")
+            except Exception as e:
+                logger.error(f"Error removing deleted employees: {e}")
 
         # Fetch Clients
         clients_response = requests.get(f"{API_BASE_URL}/client/clients", headers=headers)
         clients_response.raise_for_status()
         clients = clients_response.json()
+
+        fetched_client_ids = [cli['id'] for cli in clients]
 
         # Process and store client embeddings
         for client in clients:
@@ -194,13 +203,22 @@ def fetch_and_store_data():
             else:
                 logger.error(f"Failed to get embedding for Client ID: {client['id']}")
 
-        # # Remove deleted clients from MongoDB
-        # for cli in clients_collection.find({"person_id": {"$nin": [cli['id'] for cli in clients]}}):
-        #     clients_collection.delete_one({"_id": cli["_id"]})
-        #     faiss_index_client.remove_ids(np.array([cli["person_id"]]))
-        #     client_ids.remove(cli["person_id"])
-        #     logger.info(f"Removed deleted client ID: {cli['person_id']}")
+        # Identify and remove deleted clients from MongoDB
+        deleted_clients = clients_collection.find({"person_id": {"$nin": fetched_client_ids}})
+        deleted_client_ids = [cli['person_id'] for cli in deleted_clients]
+
+        if deleted_client_ids:
+            try:
+                clients_collection.delete_many({"person_id": {"$in": deleted_client_ids}})
+                faiss_index_client.remove_ids(np.array(deleted_client_ids))
+                client_ids = [cli_id for cli_id in client_ids if cli_id not in deleted_client_ids]
+                logger.info(f"Removed deleted clients: {deleted_client_ids}")
+            except Exception as e:
+                logger.error(f"Error removing deleted clients: {e}")
+
+        logger.info("fetch_and_store_data task completed successfully.")
         load_faiss_indexes()
+        logger.info("Faiss indexes reloaded successfully.")
     except Exception as e:
         logger.error(f"Error in fetch_and_store_data: {e}")
 

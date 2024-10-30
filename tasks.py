@@ -12,6 +12,7 @@ import numpy as np
 import faiss
 from funcs import compute_sim, setup_logger, extract_date_from_filename, get_faces_data
 from bson.binary import Binary
+from celery.signals import worker_init
 
 load_dotenv()
 
@@ -49,13 +50,19 @@ class Config:
     DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
     API_BASE_URL = os.getenv('API_BASE_URL', 'http://10.30.10.136:8000')
 
+
 def load_faiss_indexes():
     global faiss_index_employee, faiss_index_client, employee_ids, client_ids
     logger.info("Loading Faiss indexes for employees and clients.")
 
+    # Reset the indexes
+    faiss_index_employee = faiss.IndexFlatIP(DIMENSIONS)
+    faiss_index_client = faiss.IndexFlatIP(DIMENSIONS)
+    employee_ids = []
+    client_ids = []
+
     # Load employee embeddings
     employee_embeddings = []
-    employee_ids = []
     for emp in employees_collection.find({"embedding": {"$exists": True}}):
         embedding = np.array(emp['embedding']).astype('float32')
         if embedding.shape[0] != DIMENSIONS:
@@ -64,16 +71,17 @@ def load_faiss_indexes():
         embedding = embedding / np.linalg.norm(embedding)  # Normalize for cosine similarity
         employee_embeddings.append(embedding)
         employee_ids.append(emp['person_id'])
+
     if employee_embeddings:
-        faiss.normalize_L2(np.array(employee_embeddings))
-        faiss_index_employee.add(np.array(employee_embeddings))
+        employee_embeddings = np.array(employee_embeddings)
+        faiss.normalize_L2(employee_embeddings)
+        faiss_index_employee.add(employee_embeddings)
         logger.info(f"Loaded {len(employee_embeddings)} employee embeddings into Faiss index.")
     else:
         logger.warning("No employee embeddings loaded into Faiss index.")
 
     # Load client embeddings
     client_embeddings = []
-    client_ids = []
     for cli in clients_collection.find({"embedding": {"$exists": True}}):
         embedding = np.array(cli['embedding']).astype('float32')
         if embedding.shape[0] != DIMENSIONS:
@@ -82,20 +90,23 @@ def load_faiss_indexes():
         embedding = embedding / np.linalg.norm(embedding)  # Normalize for cosine similarity
         client_embeddings.append(embedding)
         client_ids.append(cli['person_id'])
+
     if client_embeddings:
-        faiss.normalize_L2(np.array(client_embeddings))
-        faiss_index_client.add(np.array(client_embeddings))
+        client_embeddings = np.array(client_embeddings)
+        faiss.normalize_L2(client_embeddings)
+        faiss_index_client.add(client_embeddings)
         logger.info(f"Loaded {len(client_embeddings)} client embeddings into Faiss index.")
     else:
         logger.warning("No client embeddings loaded into Faiss index.")
 
-@celery_app.on_after_configure.connect
-def setup_periodic_tasks(sender, **kwargs):
-    # Ensure indexes are loaded once when worker starts
+
+@worker_init.connect
+def initialize_worker(**kwargs):
     load_faiss_indexes()
 
 @celery_app.task
 def fetch_and_store_data():
+    global faiss_index_employee, faiss_index_client, employee_ids, client_ids
     logger.info("Starting fetch_and_store_data task")
 
     try:
@@ -129,12 +140,12 @@ def fetch_and_store_data():
             else:
                 logger.error(f"Failed to get embedding for Employee ID: {employee['id']}")
 
-        # Remove deleted employees from MongoDB
-        for emp in employees_collection.find({"person_id": {"$nin": [emp['id'] for emp in employees]}}):
-            employees_collection.delete_one({"_id": emp["_id"]})
-            faiss_index_employee.remove_ids(np.array([emp["person_id"]]))
-            employee_ids.remove(emp["person_id"])
-            logger.info(f"Removed deleted employee ID: {emp['person_id']}")
+        # # Remove deleted employees from MongoDB
+        # for emp in employees_collection.find({"person_id": {"$nin": [emp['id'] for emp in employees]}}):
+        #     employees_collection.delete_one({"_id": emp["_id"]})
+        #     faiss_index_employee.remove_ids(np.array([emp["person_id"]]))
+        #     employee_ids.remove(emp["person_id"])
+        #     logger.info(f"Removed deleted employee ID: {emp['person_id']}")
 
         # Fetch Clients
         clients_response = requests.get(f"{API_BASE_URL}/client/clients", headers=headers)
@@ -160,33 +171,36 @@ def fetch_and_store_data():
                             "gender": client.get('gender'),
                             "age": client.get('age'),
                             "updated_at": datetime.utcnow()
-                        }}
+                        }},
+                        upsert=True
                     )
                 else:
                     # Create new client
-                    new_client_id = clients_collection.insert_one({
-                        "person_id": client['id'],
-                        "embedding": embedding.tolist(),
-                        "first_seen": client.get('first_seen'),
-                        "last_seen": client.get('last_seen'),
-                        "visit_count": client.get('visit_count', 1),
-                        "gender": client.get('gender'),
-                        "age": client.get('age'),
-                        "updated_at": datetime.utcnow()
-                    }).inserted_id
-                    client_ids.append(new_client_id)
+                    clients_collection.update_one(
+                        {"person_id": client['id']},
+                        {"$set": {
+                            "embedding": embedding.tolist(),
+                            "first_seen": client.get('first_seen'),
+                            "last_seen": client.get('last_seen'),
+                            "visit_count": client.get('visit_count', 1),
+                            "age": client.get('age'),
+                            "updated_at": datetime.utcnow()
+                        }},
+                        upsert=True
+                    )
                     faiss_index_client.add(np.array([embedding]).astype('float32'))
+                    client_ids.append(client['id'])
                     logger.info(f"Stored/Updated embedding for Client ID: {client['id']}")
             else:
                 logger.error(f"Failed to get embedding for Client ID: {client['id']}")
 
-        # Remove deleted clients from MongoDB
-        for cli in clients_collection.find({"person_id": {"$nin": [cli['id'] for cli in clients]}}):
-            clients_collection.delete_one({"_id": cli["_id"]})
-            faiss_index_client.remove_ids(np.array([cli["person_id"]]))
-            client_ids.remove(cli["person_id"])
-            logger.info(f"Removed deleted client ID: {cli['person_id']}")
-
+        # # Remove deleted clients from MongoDB
+        # for cli in clients_collection.find({"person_id": {"$nin": [cli['id'] for cli in clients]}}):
+        #     clients_collection.delete_one({"_id": cli["_id"]})
+        #     faiss_index_client.remove_ids(np.array([cli["person_id"]]))
+        #     client_ids.remove(cli["person_id"])
+        #     logger.info(f"Removed deleted client ID: {cli['person_id']}")
+        load_faiss_indexes()
     except Exception as e:
         logger.error(f"Error in fetch_and_store_data: {e}")
 
@@ -213,8 +227,10 @@ def get_embedding_from_url(image_url):
         logger.error(f"Error fetching or processing image from URL {image_url}: {e}")
         return None
 
+
 @celery_app.task
 def process_image_task(file_path, camera_id):
+    global faiss_index_employee, faiss_index_client, employee_ids, client_ids
     logger.info(f"Processing image: {file_path} from camera_id: {camera_id}")
     try:
         image = cv2.imread(file_path)
@@ -222,14 +238,9 @@ def process_image_task(file_path, camera_id):
             logger.error(f"Failed to read image from {file_path}")
             return
 
-        # Convert from BGR to RGB only once
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        logger.debug(f"Image shape: {image_rgb.shape}")
-
-        # Resize image to standard size
         image_resized = cv2.resize(image_rgb, (640, 480))
 
-        # Perform face detection
         faces = face_app.get(image_resized)
         logger.info(f"Faces detected: {len(faces)} in image: {file_path}")
 
@@ -255,15 +266,15 @@ def process_image_task(file_path, camera_id):
             return
         embedding = embedding / norm
 
-        # Search for matching employee
+        # Search for matching employee first
+        print(f"Total employees: {faiss_index_employee.ntotal}")
         if faiss_index_employee.ntotal > 0:
             D_emp, I_emp = faiss_index_employee.search(np.array([embedding]), k=1)
-            similarity_emp = 1 - D_emp[0][0] / (2 * Config.DIMENSIONS)  # Cosine similarity
+            similarity_emp = float(D_emp[0][0])  # Get cosine similarity directly
             if similarity_emp > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
                 employee_id = employee_ids[I_emp[0][0]]
                 employee = employees_collection.find_one({"person_id": employee_id})
                 if employee:
-                    # Send attendance to API
                     save_attendance_to_api(
                         person_id=employee['person_id'],
                         device_id=camera_id,
@@ -271,18 +282,21 @@ def process_image_task(file_path, camera_id):
                         timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                         score=similarity_emp
                     )
-                    logger.info(f"Attendance sent for employee {employee['person_id']} with similarity {similarity_emp}")
+                    logger.info(
+                        f"Attendance sent for employee {employee['person_id']} with similarity {similarity_emp}")
                     return
 
-        # Search for matching client
+        # Then search for matching client
+        print(f"Total clients: {faiss_index_client.ntotal}")
         if faiss_index_client.ntotal > 0:
             D_cli, I_cli = faiss_index_client.search(np.array([embedding]), k=1)
-            similarity_cli = 1 - D_cli[0][0] / (2 * Config.DIMENSIONS)  # Cosine similarity
+            similarity_cli = float(D_cli[0][0])  # Get cosine similarity directly
+
+            logger.info(f"Best client match similarity: {similarity_cli}")
             if similarity_cli > Config.CHECK_NEW_CLIENT:
                 client_id = client_ids[I_cli[0][0]]
                 client = clients_collection.find_one({"person_id": client_id})
                 if client:
-                    # Update client visit via API
                     update_client_via_api(
                         client_id=client['person_id'],
                         datetime=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -291,31 +305,35 @@ def process_image_task(file_path, camera_id):
                     logger.info(f"Client {client['person_id']} visit updated with similarity {similarity_cli}")
                     return
 
-        # New client; create via API
-        # Assuming gender and age can be extracted from face_data
+        # If no match found, create new client
         new_client_id = create_client_via_api(
-            image_path=file_path,  # Pass the local file path
+            image_path=file_path,
             first_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             last_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             gender=int(face_data.gender),
-            age=int(face_data.age),
-            embedding=embedding  # Pass the embedding for immediate indexing
+            age=int(face_data.age)
         )
+
         if new_client_id:
-            # Add the new client's embedding and ID to FAISS index and client_ids list
-            faiss_index_client.add(np.array([embedding]).astype('float32'))
+            # Store the embedding in MongoDB
+            clients_collection.update_one(
+                {"person_id": new_client_id},
+                {"$set": {"embedding": embedding.tolist()}},
+                upsert=True
+            )
+
+            # Add to Faiss index
+            faiss_index_client.add(np.array([embedding]))
             client_ids.append(new_client_id)
-            logger.info(f"New client (ID: {new_client_id}) added to Faiss index.")
+            logger.info(f"New client created and indexed with ID: {new_client_id}")
         else:
-            logger.error("Failed to retrieve new client ID after creation.")
+            logger.error("Failed to create new client")
 
     except Exception as e:
         logger.error(f"Error processing image {file_path}: {e}")
     finally:
-        # Clean up the processed file
         if os.path.exists(file_path):
             os.remove(file_path)
-        # Remove corresponding BACKGROUND file if it exists
         bg_file = file_path.replace('SNAP', 'BACKGROUND')
         if os.path.exists(bg_file):
             os.remove(bg_file)
@@ -353,7 +371,7 @@ def update_client_via_api(client_id, datetime, device_id):
     except Exception as e:
         logger.error(f"Error updating client visit via API: {e}")
 
-def create_client_via_api(image_path, first_seen, last_seen, gender, age, embedding):
+def create_client_via_api(image_path, first_seen, last_seen, gender, age):
     """Create a new client via FastAPI API and return the new client ID"""
     endpoint = "/client/create"
     data = {

@@ -78,7 +78,7 @@ class CameraCapture:
         for attempt in range(max_retries):
             try:
                 logging.info(f"Attempting to initialize IP camera, attempt {attempt + 1}")
-                camera = cv2.VideoCapture(phone_camera_url)
+                camera = cv2.VideoCapture(0)
 
                 if camera.isOpened():
                     ret, frame = camera.read()
@@ -211,10 +211,10 @@ class CameraCapture:
                     y2_orig = int(y2 * scale_y)
 
                     # Extract the face region with margin
-                    margin = 100  # Reduced margin for efficiency
+                    margin = 100
                     y1_m, y2_m = max(0, y1_orig - margin), min(original_height, y2_orig + margin)
                     x1_m, x2_m = max(0, x1_orig - margin), min(original_width, x2_orig + margin)
-                    face_frame = display_frame[y1_m:y2_m, x1_m:x2_m]
+                    face_frame = frame[y1_m:y2_m, x1_m:x2_m]  # Using original frame
 
                     # Calculate sharpness
                     sharpness = self.calculate_image_sharpness(face_frame)

@@ -14,7 +14,7 @@ import cProfile
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from tasks import process_image_task
+from tasks import process_image_task, fetch_and_store_data, faiss_index_employee, faiss_index_client
 
 load_dotenv()
 
@@ -327,6 +327,10 @@ class ImageHandler(FileSystemEventHandler):
 if __name__ == '__main__':
     load_dotenv()
     images_folder = os.getenv('IMAGES_FOLDER', '/path/to/images')
+    fetch_and_store_data()
+    print("Starting main runner...")
+    print(f"Total employees: {faiss_index_employee.ntotal}")
+    print(f"Total clients: {faiss_index_client.ntotal}")
     runner = MainRunner(images_folder)
     profiler = cProfile.Profile()
     profiler.enable()

@@ -1,4 +1,5 @@
 # main_new.py
+
 import os
 import threading
 import time
@@ -8,17 +9,18 @@ from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 from pymongo import MongoClient
 import requests
-from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
 import faiss
-import cProfile
-
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from tasks import process_image_task, fetch_and_store_data, faiss_index_employee, faiss_index_client
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from datetime import datetime
+from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
+from bson.binary import Binary
 
 load_dotenv()
 
-
+# Configuration Class
 class Config:
     CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.5))  # Similarity threshold for clients
     EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.5))  # Similarity threshold for employees
@@ -29,311 +31,566 @@ class Config:
     DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
     DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
     API_BASE_URL = os.getenv('API_BASE_URL', 'http://10.30.10.136:8000')
+    API_TOKEN = os.getenv('API_TOKEN', 'your_api_token_here')  # Ensure this is set in your .env
+    IMAGES_FOLDER = os.getenv('IMAGES_FOLDER', '/path/to/images')  # Update with your images folder path
+    FETCH_STORE_INTERVAL = int(os.getenv('FETCH_STORE_INTERVAL', 300))  # Interval in seconds
 
-
-def send_report(endpoint, data, files=None):
-    url = f"{Config.API_BASE_URL}{endpoint}"
-    try:
-        response = requests.post(url, data=data, files=files)
-        response.raise_for_status()
-        Config.logger.info(f"Successfully sent report to {endpoint}")
-    except requests.RequestException as e:
-        Config.logger.error(f"Failed to send report to {endpoint}: {e}")
-
-
-class Database:
+# Database and Faiss Index Management
+class DatabaseManager:
     def __init__(self):
-        self.client = MongoClient(os.getenv('MONGODB_LOCAL'))
-        self.db = self.client.empl_time_fastapi
-        self.employees = self.db.employees
-        self.clients = self.db.clients
-        self.attendance = self.db.attendance
+        self.mongo_client = MongoClient(os.getenv('MONGODB_LOCAL'))
+        self.mongo_db = self.mongo_client.empl_time_fastapi
+        self.employees_collection = self.mongo_db.employees
+        self.clients_collection = self.mongo_db.clients
 
-        # Initialize Faiss index for employees
-        self.employee_embeddings = [np.array(emp['embedding']) for emp in self.employees.find({"embedding": {"$exists": True}})]
-        if self.employee_embeddings:
-            self.employee_index = faiss.IndexFlatL2(Config.DIMENSIONS)
-            self.employee_index.add(np.array(self.employee_embeddings).astype('float32'))
-        else:
-            self.employee_index = None
+        # Initialize Faiss indexes with Inner Product for cosine similarity
+        self.DIMENSIONS = Config.DIMENSIONS
+        self.faiss_index_employee = faiss.IndexFlatIP(self.DIMENSIONS)
+        self.faiss_index_client = faiss.IndexFlatIP(self.DIMENSIONS)
+        self.employee_ids = []
+        self.client_ids = []
+        self.lock = threading.Lock()
 
-        # Similarly, initialize Faiss index for clients
-        self.client_embeddings = [np.array(cli['embedding']) for cli in self.clients.find({"embedding": {"$exists": True}})]
-        if self.client_embeddings:
-            self.client_index = faiss.IndexFlatL2(Config.DIMENSIONS)
-            self.client_index.add(np.array(self.client_embeddings).astype('float32'))
-        else:
-            self.client_index = None
+        # Maintain a mapping from person_id to embedding for compute_sim
+        self.employee_embeddings_map = {}
+        self.client_embeddings_map = {}
+
+        self.load_faiss_indexes()
+
+    def load_faiss_indexes(self):
+        with self.lock:
+            Config.logger.info("Loading Faiss indexes for employees and clients.")
+
+            # Reset the indexes
+            self.faiss_index_employee.reset()
+            self.faiss_index_client.reset()
+            self.employee_ids = []
+            self.client_ids = []
+            self.employee_embeddings_map = {}
+            self.client_embeddings_map = {}
+
+            # Load employee embeddings
+            employee_embeddings = []
+            for emp in self.employees_collection.find({"embedding": {"$exists": True}}):
+                embedding = np.array(emp['embedding']).astype('float32')
+                if embedding.shape[0] != self.DIMENSIONS:
+                    Config.logger.warning(f"Employee ID {emp['person_id']} has invalid embedding shape.")
+                    continue
+                norm = np.linalg.norm(embedding)
+                if norm == 0:
+                    Config.logger.warning(f"Employee ID {emp['person_id']} has zero norm embedding.")
+                    continue
+                embedding = embedding / norm  # Normalize for cosine similarity
+                employee_embeddings.append(embedding)
+                self.employee_ids.append(emp['person_id'])
+                self.employee_embeddings_map[emp['person_id']] = embedding
+
+            if employee_embeddings:
+                employee_embeddings = np.array(employee_embeddings)
+                faiss.normalize_L2(employee_embeddings)  # Ensure normalization
+                self.faiss_index_employee.add(employee_embeddings)
+                Config.logger.info(f"Loaded {len(employee_embeddings)} employee embeddings into Faiss index.")
+            else:
+                Config.logger.warning("No employee embeddings loaded into Faiss index.")
+
+            # Load client embeddings
+            client_embeddings = []
+            for cli in self.clients_collection.find({"embedding": {"$exists": True}}):
+                embedding = np.array(cli['embedding']).astype('float32')
+                if embedding.shape[0] != self.DIMENSIONS:
+                    Config.logger.warning(f"Client ID {cli['person_id']} has invalid embedding shape.")
+                    continue
+                norm = np.linalg.norm(embedding)
+                if norm == 0:
+                    Config.logger.warning(f"Client ID {cli['person_id']} has zero norm embedding.")
+                    continue
+                embedding = embedding / norm  # Normalize for cosine similarity
+                client_embeddings.append(embedding)
+                self.client_ids.append(cli['person_id'])
+                self.client_embeddings_map[cli['person_id']] = embedding
+
+            if client_embeddings:
+                client_embeddings = np.array(client_embeddings)
+                faiss.normalize_L2(client_embeddings)  # Ensure normalization
+                self.faiss_index_client.add(client_embeddings)
+                Config.logger.info(f"Loaded {len(client_embeddings)} client embeddings into Faiss index.")
+            else:
+                Config.logger.warning("No client embeddings loaded into Faiss index.")
+
+    def add_employee_embedding(self, person_id, embedding):
+        with self.lock:
+            norm = np.linalg.norm(embedding)
+            if norm == 0:
+                Config.logger.error(f"Cannot add employee {person_id} with zero norm embedding.")
+                return
+            embedding = embedding / norm
+            self.employees_collection.update_one(
+                {"person_id": person_id},
+                {"$set": {
+                    "embedding": embedding.tolist(),
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+            self.faiss_index_employee.add(np.array([embedding]).astype('float32'))
+            self.employee_ids.append(person_id)
+            self.employee_embeddings_map[person_id] = embedding
+            Config.logger.info(f"Stored/Updated embedding for Employee ID: {person_id}")
+
+    def add_client_embedding(self, person_id, embedding):
+        with self.lock:
+            norm = np.linalg.norm(embedding)
+            if norm == 0:
+                Config.logger.error(f"Cannot add client {person_id} with zero norm embedding.")
+                return
+            embedding = embedding / norm
+            self.clients_collection.update_one(
+                {"person_id": person_id},
+                {"$set": {
+                    "embedding": embedding.tolist(),
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+            self.faiss_index_client.add(np.array([embedding]).astype('float32'))
+            self.client_ids.append(person_id)
+            self.client_embeddings_map[person_id] = embedding
+            Config.logger.info(f"Stored/Updated embedding for Client ID: {person_id}")
+
+    def remove_deleted_employees(self, fetched_employee_ids):
+        with self.lock:
+            deleted_employees = self.employees_collection.find({"person_id": {"$nin": fetched_employee_ids}})
+            deleted_employee_ids = [emp['person_id'] for emp in deleted_employees]
+
+            if deleted_employee_ids:
+                try:
+                    self.employees_collection.delete_many({"person_id": {"$in": deleted_employee_ids}})
+                    Config.logger.info(f"Removed deleted employees: {deleted_employee_ids}")
+                    # Rebuild Faiss index
+                    self.load_faiss_indexes()
+                except Exception as e:
+                    Config.logger.error(f"Error removing deleted employees: {e}")
+
+    def remove_deleted_clients(self, fetched_client_ids):
+        with self.lock:
+            deleted_clients = self.clients_collection.find({"person_id": {"$nin": fetched_client_ids}})
+            deleted_client_ids = [cli['person_id'] for cli in deleted_clients]
+
+            if deleted_client_ids:
+                try:
+                    self.clients_collection.delete_many({"person_id": {"$in": deleted_client_ids}})
+                    Config.logger.info(f"Removed deleted clients: {deleted_client_ids}")
+                    # Rebuild Faiss index
+                    self.load_faiss_indexes()
+                except Exception as e:
+                    Config.logger.error(f"Error removing deleted clients: {e}")
 
     def find_matching_employee(self, embedding):
-        if not self.employee_index:
+        with self.lock:
+            if self.faiss_index_employee.ntotal == 0:
+                return None, 0
+            D, I = self.faiss_index_employee.search(np.array([embedding]).astype('float32'), k=1)
+            if I[0][0] == -1:
+                return None, 0
+            similarity = float(D[0][0])  # Cosine similarity
+            similarity = min(max(similarity, -1.0), 1.0)  # Cap similarity
+            Config.logger.debug(f"Faiss similarity: {similarity}")
+            if similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
+                employee_id = self.employee_ids[I[0][0]]
+                employee = self.employees_collection.find_one({"person_id": employee_id})
+                # Verify using compute_sim
+                matched_embedding = self.employee_embeddings_map.get(employee_id)
+                if matched_embedding is not None:
+                    computed_similarity = compute_sim(tuple(embedding), tuple(matched_embedding))
+                    if computed_similarity is not None:
+                        computed_similarity = min(max(computed_similarity, -1.0), 1.0)
+                        Config.logger.debug(f"Computed similarity for Employee ID {employee_id}: {computed_similarity}")
+                        if computed_similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
+                            return employee, computed_similarity
+                return employee, similarity
             return None, 0
-        D, I = self.employee_index.search(np.array([embedding]).astype('float32'), k=1)
-        similarity = 1 - D[0][0] / (2 * Config.DIMENSIONS)  # Example similarity metric
-        if similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
-            employee = self.employees.find_one({"embedding": self.employee_embeddings[I[0][0]].tolist()})
-            return employee, similarity
-        return None, 0
 
     def find_matching_client(self, embedding):
-        if not self.client_index:
+        with self.lock:
+            if self.faiss_index_client.ntotal == 0:
+                return None, 0
+            D, I = self.faiss_index_client.search(np.array([embedding]).astype('float32'), k=1)
+            if I[0][0] == -1:
+                return None, 0
+            similarity = float(D[0][0])  # Cosine similarity
+            similarity = min(max(similarity, -1.0), 1.0)  # Cap similarity
+            Config.logger.debug(f"Faiss similarity: {similarity}")
+            if similarity > Config.CHECK_NEW_CLIENT:
+                client_id = self.client_ids[I[0][0]]
+                client = self.clients_collection.find_one({"person_id": client_id})
+                # Verify using compute_sim
+                matched_embedding = self.client_embeddings_map.get(client_id)
+                if matched_embedding is not None:
+                    computed_similarity = compute_sim(tuple(embedding), tuple(matched_embedding))
+                    if computed_similarity is not None:
+                        computed_similarity = min(max(computed_similarity, -1.0), 1.0)
+                        Config.logger.debug(f"Computed similarity for Client ID {client_id}: {computed_similarity}")
+                        if computed_similarity > Config.CHECK_NEW_CLIENT:
+                            return client, computed_similarity
+                return client, similarity
             return None, 0
-        D, I = self.client_index.search(np.array([embedding]).astype('float32'), k=1)
-        similarity = 1 - D[0][0] / (2 * Config.DIMENSIONS)  # Example similarity metric
-        if similarity > Config.CHECK_NEW_CLIENT:
-            client = self.clients.find_one({"embedding": self.client_embeddings[I[0][0]].tolist()})
-            return client, similarity
-        return None, 0
 
-    def save_attendance_to_api(self, person_id, device_id, image_url, timestamp, score):
-        """Send attendance data to FastAPI API"""
-        endpoint = "/attendance/create"  # Adjust as per actual API endpoint
-        data = {
-            'employee_id': person_id,
-            'device_id': device_id,
-            'timestamp': timestamp,
-            'score': score
-        }
-        try:
-            image_response = requests.get(image_url)
-            image_response.raise_for_status()
-            files = {
-                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
-            }
-            send_report(endpoint, data, files)
-        except Exception as e:
-            Config.logger.error(f"Error sending attendance to API: {e}")
-
-    def update_client_via_api(self, client_id, image_url, timestamp, device_id):
-        """Send client visit data to FastAPI API"""
-        endpoint = f"/client/visit-history/{client_id}"
-        data = {
-            'datetime': timestamp,
-            'device_id': device_id
-        }
-        try:
-            image_response = requests.get(image_url)
-            image_response.raise_for_status()
-            files = {
-                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
-            }
-            send_report(endpoint, data, files)
-        except Exception as e:
-            Config.logger.error(f"Error updating client visit via API: {e}")
-
-    def create_client_via_api(self, image_url, first_seen, last_seen, gender, age):
-        """Create a new client via FastAPI API"""
-        endpoint = "/client/create"
-        data = {
-            'first_seen': first_seen,
-            'last_seen': last_seen,
-            'gender': gender,
-            'age': age
-        }
-        try:
-            image_response = requests.get(image_url)
-            image_response.raise_for_status()
-            files = {
-                'image': (os.path.basename(image_url), image_response.content, 'image/jpeg')
-            }
-            send_report(endpoint, data, files)
-        except Exception as e:
-            Config.logger.error(f"Error creating new client via API: {e}")
-
-
+# Face Analysis and Processing
 class FaceProcessor:
     def __init__(self):
         # Initialize FaceAnalysis with desired models
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use CPU only
+        self.app.prepare(ctx_id=-1, det_size=Config.DET_SIZE)
 
-    def process_image(self, image):
+    def get_embedding_from_image(self, image):
         faces = self.app.get(image)
-        Config.logger.debug(f"Total faces detected before filtering: {len(faces)}")
-        # Filter faces based on detection confidence
-        faces = [face for face in faces if face.det_score >= Config.MIN_DETECTION_CONFIDENCE]
-        Config.logger.debug(f"Faces after filtering: {len(faces)}")
-        return faces
+        if not faces:
+            return None
+        # Get the face with the highest detection score
+        face = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
+        if face:
+            embedding = face.embedding
+            # Normalize embedding
+            norm = np.linalg.norm(embedding)
+            Config.logger.debug(f"Embedding norm: {norm}")
+            if norm == 0:
+                Config.logger.warning("Detected face has zero norm embedding.")
+                return None
+            embedding = embedding / norm
+            Config.logger.debug(f"Normalized embedding: {embedding}")
+            return embedding
+        return None
 
+# API Interaction Functions
+def save_attendance_to_api(person_id, device_id, image_path, timestamp, score):
+    """Send attendance data to FastAPI API"""
+    endpoint = "/attendance/create"  # Adjust as per actual API endpoint
+    data = {
+        'employee_id': person_id,
+        'device_id': device_id,
+        'timestamp': timestamp,
+        'score': score
+    }
+    try:
+        headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
+        with open(image_path, 'rb') as img_file:
+            files = {
+                'image': (os.path.basename(image_path), img_file, 'image/jpeg')
+            }
+            response = send_report(endpoint, data=data, files=files, headers=headers)
+            if response:
+                Config.logger.info(f"Attendance sent for employee {person_id} with similarity {score}")
+    except Exception as e:
+        Config.logger.error(f"Error sending attendance to API: {e}")
 
-class MainRunner:
-    def __init__(self, images_folder):
-        self.images_folder = images_folder
-        self.db = Database()
-        self.face_processor = FaceProcessor()
-        self.lock = threading.Lock()
-        self.logger = Config.logger
+def update_client_via_api(client_id, datetime_str, device_id):
+    """Send client visit data to FastAPI API"""
+    endpoint = f"/client/visit-history/{client_id}"
+    data = {
+        'datetime': datetime_str,
+        'device_id': device_id
+    }
+    try:
+        headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
+        response = send_report_json(endpoint, data=data, headers=headers)
+        if response:
+            Config.logger.info(f"Client {client_id} visit updated.")
+    except Exception as e:
+        Config.logger.error(f"Error updating client visit via API: {e}")
 
-    def process_faces(self, face_data, image_url, camera_id, timestamp):
-        embedding = face_data.embedding
+def create_client_via_api(image_path, first_seen, last_seen, gender, age):
+    """Create a new client via FastAPI API and return the new client ID"""
+    endpoint = "/client/create"
+    data = {
+        'first_seen': first_seen,
+        'last_seen': last_seen
+    }
+    # Query Parameters
+    params = {
+        'visit_count': 1,
+        'gender': gender,
+        'age': age
+    }
+    try:
+        headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
+        with open(image_path, 'rb') as img_file:
+            files = {
+                'image': (os.path.basename(image_path), img_file, 'image/jpeg')
+            }
+            response = send_report_with_response(endpoint, data=data, files=files, params=params, headers=headers)
+            if response and response.status_code == 200:
+                client_data = response.json()
+                new_client_id = client_data.get('data', {}).get('id')
+                if new_client_id:
+                    Config.logger.info(f"New client created with ID: {new_client_id}")
+                    return new_client_id
+                else:
+                    Config.logger.error("New client ID not found in the API response.")
+                    return None
+            else:
+                Config.logger.error(f"Failed to create new client. Status Code: {response.status_code if response else 'No Response'}")
+                return None
+    except Exception as e:
+        Config.logger.error(f"Error creating new client via API: {e}")
+        return None
 
-        # Check against employees
-        best_match_employee, similarity_employee = self.db.find_matching_employee(embedding)
+def send_report(endpoint, data=None, files=None, headers=None):
+    url = f"{Config.API_BASE_URL}{endpoint}"
+    try:
+        response = requests.post(url, data=data, files=files, headers=headers)
+        response.raise_for_status()
+        Config.logger.info(f"Successfully sent report to {endpoint}")
+        return response
+    except requests.RequestException as e:
+        Config.logger.error(f"Failed to send report to {endpoint}: {e}")
+        return None
 
-        if best_match_employee:
-            # Employee recognized; send attendance to API
-            self.db.save_attendance_to_api(
-                person_id=best_match_employee['person_id'],
-                device_id=camera_id,
-                image_url=image_url,
-                timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                score=face_data.det_score
-            )
-            Config.logger.info(f"Attendance sent for employee {best_match_employee['person_id']} with similarity {similarity_employee}")
+def send_report_json(endpoint, data=None, headers=None):
+    """Send JSON report to FastAPI API"""
+    url = f"{Config.API_BASE_URL}{endpoint}"
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        response.raise_for_status()
+        Config.logger.info(f"Successfully sent JSON report to {endpoint}")
+        return response
+    except requests.RequestException as e:
+        # Attempt to log the response content for detailed error information
+        try:
+            error_content = response.json()
+            Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}, Response: {error_content}")
+        except:
+            Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}")
+        return None
+
+def send_report_with_response(endpoint, data=None, files=None, params=None, headers=None):
+    """Send report and return the response object"""
+    url = f"{Config.API_BASE_URL}{endpoint}"
+    try:
+        response = requests.post(url, data=data, files=files, params=params, headers=headers)
+        response.raise_for_status()
+        Config.logger.info(f"Successfully sent report to {endpoint}")
+        return response
+    except requests.RequestException as e:
+        Config.logger.error(f"Failed to send report to {endpoint}: {e}")
+        return None
+
+# Image Processing Function
+def process_image(file_path, camera_id, db_manager, face_processor):
+    Config.logger.info(f"Processing image: {file_path} from camera_id: {camera_id}")
+    try:
+        image = cv2.imread(file_path)
+        if image is None:
+            Config.logger.error(f"Failed to read image from {file_path}")
             return
 
-        # Check against clients
-        matching_client, similarity_client = self.db.find_matching_client(embedding)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image_rgb, Config.DET_SIZE)
 
-        if matching_client:
-            # Existing client; send visit update to API
-            self.db.update_client_via_api(
-                client_id=matching_client['person_id'],
-                image_url=image_url,
+        embedding = face_processor.get_embedding_from_image(image_resized)
+        if embedding is None:
+            Config.logger.error(f"No face embedding found in image: {file_path}")
+            return
+
+        timestamp = extract_date_from_filename(os.path.basename(file_path))
+        if not timestamp:
+            Config.logger.error(f"Could not extract date from filename: {file_path}")
+            return
+
+        # Construct image URL based on known pattern
+        image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(file_path)}"
+
+        # Search for matching employee
+        employee, similarity_emp = db_manager.find_matching_employee(embedding)
+        if employee:
+            save_attendance_to_api(
+                person_id=employee['person_id'],
+                device_id=camera_id,
+                image_path=file_path,
                 timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                score=similarity_emp
+            )
+            return
+
+        # Search for matching client
+        client, similarity_cli = db_manager.find_matching_client(embedding)
+        if client:
+            update_client_via_api(
+                client_id=client['person_id'],
+                datetime_str=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                 device_id=camera_id
             )
-            Config.logger.info(f"Client {matching_client['person_id']} visit updated with similarity {similarity_client}")
+            logging.info(f"Client {client['person_id']} visited with similarity {similarity_cli}")
+            return
+
+        # If no match found, create new client
+        new_client_id = create_client_via_api(
+            image_path=file_path,
+            first_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            last_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            gender=int(0),  # Placeholder, replace with actual gender extraction if available
+            age=int(30)      # Placeholder, replace with actual age extraction if available
+        )
+
+        if new_client_id:
+            # Store the embedding in MongoDB
+            db_manager.add_client_embedding(new_client_id, embedding)
         else:
-            # New client; create via API
-            # For the purpose of this example, assuming gender and age can be extracted from face_data
-            self.db.create_client_via_api(
-                image_url=image_url,
-                first_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                last_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                gender=int(face_data.gender),
-                age=int(face_data.age)
-            )
-            Config.logger.info(f"New client created from image {image_url}")
+            Config.logger.error("Failed to create new client")
 
-    def process_image_file(self, file_path, camera_id):
-        try:
-            image = cv2.imread(file_path)
-            if image is None:
-                Config.logger.error(f"Failed to read image from {file_path}")
-                return
+    except Exception as e:
+        Config.logger.error(f"Error processing image {file_path}: {e}")
+    finally:
+        # Clean up the processed file
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        # Remove corresponding BACKGROUND file if it exists
+        bg_file = file_path.replace('SNAP', 'BACKGROUND')
+        if os.path.exists(bg_file):
+            os.remove(bg_file)
 
-            # Convert from BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            Config.logger.debug(f"Image shape: {image.shape}")
+# Fetch and Store Data Function
+def fetch_and_store_data(db_manager, face_processor):
+    Config.logger.info("Starting fetch_and_store_data task")
 
-            # Resize image to standard size
-            image_resized = cv2.resize(image, Config.DET_SIZE)
+    try:
+        headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
+        # Fetch Employees
+        employees_response = requests.get(f"{Config.API_BASE_URL}/employee/employees", headers=headers)
+        employees_response.raise_for_status()
+        employees = employees_response.json()
 
-            faces = self.face_processor.process_image(image_resized)
+        fetched_employee_ids = [emp['id'] for emp in employees]
 
-            Config.logger.info(f"Processing file: {file_path}, Faces detected: {len(faces)}")
-            if not faces:
-                Config.logger.error(f"No faces found in the image: {file_path}")
-                return
+        # Process and store employee embeddings
+        for employee in employees:
+            image_url = f"{Config.API_BASE_URL}/{employee['image']}"
+            embedding = get_embedding_from_url(image_url, face_processor)
+            if embedding is not None:
+                db_manager.add_employee_embedding(employee['id'], embedding)
+            else:
+                Config.logger.error(f"Failed to get embedding for Employee ID: {employee['id']}")
 
-            face_data = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
-            if not face_data:
-                Config.logger.error(f"Could not extract face data from image: {file_path}")
-                return
+        # Identify and remove deleted employees from MongoDB
+        db_manager.remove_deleted_employees(fetched_employee_ids)
 
-            timestamp = extract_date_from_filename(os.path.basename(file_path))
-            if not timestamp:
-                Config.logger.error(f"Could not extract date from filename: {file_path}")
-                return
+        # Fetch Clients
+        clients_response = requests.get(f"{Config.API_BASE_URL}/client/clients", headers=headers)
+        clients_response.raise_for_status()
+        clients = clients_response.json()
 
-            # Construct image URL based on known pattern
-            image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(file_path)}"
+        fetched_client_ids = [cli['id'] for cli in clients]
 
-            self.process_faces(face_data, image_url, camera_id, timestamp)
+        # Process and store client embeddings
+        for client in clients:
+            image_url = f"{Config.API_BASE_URL}/{client['image']}"
+            embedding = get_embedding_from_url(image_url, face_processor)
+            if embedding is not None:
+                if db_manager.clients_collection.find_one({"person_id": client['id']}):
+                    # Update existing client
+                    db_manager.clients_collection.update_one(
+                        {"person_id": client['id']},
+                        {"$set": {
+                            "embedding": embedding.tolist(),
+                            "first_seen": client.get('first_seen'),
+                            "last_seen": client.get('last_seen'),
+                            "visit_count": client.get('visit_count', 1),
+                            "gender": client.get('gender'),
+                            "age": client.get('age'),
+                            "updated_at": datetime.utcnow()
+                        }},
+                        upsert=True
+                    )
+                    # Update embedding mapping
+                    db_manager.client_embeddings_map[client['id']] = embedding
+                    Config.logger.info(f"Updated embedding for Client ID: {client['id']}")
+                else:
+                    # Create new client
+                    db_manager.add_client_embedding(client['id'], embedding)
+                    Config.logger.info(f"Stored new embedding for Client ID: {client['id']}")
+            else:
+                Config.logger.error(f"Failed to get embedding for Client ID: {client['id']}")
 
-        except Exception as e:
-            Config.logger.error(f"Error processing image {file_path}: {e}")
-        finally:
-            # Clean up the processed file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            # Remove corresponding BACKGROUND file if it exists
-            bg_file = file_path.replace('SNAP', 'BACKGROUND')
-            if os.path.exists(bg_file):
-                os.remove(bg_file)
+        # Identify and remove deleted clients from MongoDB
+        db_manager.remove_deleted_clients(fetched_client_ids)
 
-    def run(self):
-        self.logger.info(f"Starting directory observer for: {self.images_folder}")
-        event_handler = ImageHandler(self.logger)
-        observer = Observer()
-        test_camera_dir = os.path.join(self.images_folder, 'test_camera')
-        os.makedirs(test_camera_dir, exist_ok=True)
-        observer.schedule(event_handler, path=test_camera_dir, recursive=False)
-        observer.start()
-        try:
-            while True:
-                time.sleep(10)  # Sleep longer since Watchdog handles events
-        except KeyboardInterrupt:
-            self.logger.info("Stopping directory observer.")
-            observer.stop()
-        observer.join()
+        Config.logger.info("fetch_and_store_data task completed successfully.")
+    except Exception as e:
+        Config.logger.error(f"Error in fetch_and_store_data: {e}")
 
-    def add_employee(self, image_path, person_id):
-        try:
-            image = cv2.imread(image_path)
-            if image is None:
-                raise ValueError("Failed to read image")
+def get_embedding_from_url(image_url, face_processor):
+    try:
+        headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
+        response = requests.get(image_url, headers=headers)
+        response.raise_for_status()
+        image_array = np.frombuffer(response.content, np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if image is None:
+            Config.logger.error(f"Failed to decode image from URL: {image_url}")
+            return None
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        embedding = face_processor.get_embedding_from_image(image_rgb)
+        if embedding is None:
+            Config.logger.warning(f"No faces detected in image from URL: {image_url}")
+            return None
+        return embedding
+    except Exception as e:
+        Config.logger.error(f"Error fetching or processing image from URL {image_url}: {e}")
+        return None
 
-            # Convert from BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+# Periodic Task Scheduler
+def schedule_fetch_and_store(db_manager, face_processor, interval):
+    while True:
+        fetch_and_store_data(db_manager, face_processor)
+        time.sleep(interval)
 
-            # Resize image to standard size
-            image = cv2.resize(image, (640, 480))
-
-            faces = self.face_processor.process_image(image)
-            if not faces:
-                raise ValueError("No face detected in the image")
-
-            face_data = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
-            if not face_data:
-                raise ValueError("Could not process face data")
-
-            # Instead of saving to MongoDB, send to API
-            image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(image_path)}"
-            data = {
-                'name': 'Employee Name',  # Replace with actual data
-                'email': 'employee@example.com',  # Replace with actual data
-                'phone': '1234567890',  # Replace with actual data
-                'department_id': 1  # Replace with actual data
-            }
-            files = {
-                'image': (os.path.basename(image_path), open(image_path, 'rb'), 'image/jpeg')
-            }
-            response = requests.post(
-                f"{Config.API_BASE_URL}/employee/create",
-                data=data,
-                files=files,
-            )
-            response.raise_for_status()
-            Config.logger.info(f"Employee created via API with ID: {person_id}")
-            return True
-        except Exception as e:
-            Config.logger.error(f"Error adding employee: {e}")
-            return False
-
-
+# Image Handler for Watchdog
 class ImageHandler(FileSystemEventHandler):
-    def __init__(self, logger):
+    def __init__(self, executor, db_manager, face_processor, logger):
         super().__init__()
+        self.executor = executor
+        self.db_manager = db_manager
+        self.face_processor = face_processor
         self.logger = logger
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith('SNAP.jpg'):
             self.logger.info(f"New image detected: {event.src_path}")
-            # Dispatch a Celery task to process the image
-            process_image_task.delay(event.src_path, camera_id=1)
+            # Dispatch a thread to process the image
+            self.executor.submit(process_image, event.src_path, camera_id=1, db_manager=self.db_manager, face_processor=self.face_processor)
 
+# Main Runner Class
+class MainRunner:
+    def __init__(self, images_folder):
+        self.images_folder = images_folder
+        self.db_manager = DatabaseManager()
+        self.face_processor = FaceProcessor()
+        self.executor = ThreadPoolExecutor(max_workers=10)  # Adjust the number of workers as needed
+        self.logger = Config.logger
+
+    def run(self):
+        self.logger.info(f"Starting directory observer for: {self.images_folder}")
+        event_handler = ImageHandler(self.executor, self.db_manager, self.face_processor, self.logger)
+        observer = Observer()
+        test_camera_dir = os.path.join(self.images_folder, 'test_camera')
+        os.makedirs(test_camera_dir, exist_ok=True)
+        observer.schedule(event_handler, path=test_camera_dir, recursive=False)
+        observer.start()
+
+        # Start the periodic fetch_and_store_data in a separate thread
+        fetch_thread = threading.Thread(target=schedule_fetch_and_store, args=(self.db_manager, self.face_processor, Config.FETCH_STORE_INTERVAL), daemon=True)
+        fetch_thread.start()
+
+        try:
+            while True:
+                time.sleep(1)  # Keep the main thread alive
+        except KeyboardInterrupt:
+            self.logger.info("Stopping directory observer.")
+            observer.stop()
+        observer.join()
+        self.executor.shutdown(wait=True)
+
+# Entry Point
 if __name__ == '__main__':
-    load_dotenv()
-    images_folder = os.getenv('IMAGES_FOLDER', '/path/to/images')
-    fetch_and_store_data()
-    print("Starting main runner...")
-    print(f"Total employees: {faiss_index_employee.ntotal}")
-    print(f"Total clients: {faiss_index_client.ntotal}")
+    images_folder = Config.IMAGES_FOLDER
     runner = MainRunner(images_folder)
-    profiler = cProfile.Profile()
-    profiler.enable()
     runner.run()
-    profiler.disable()
-    profiler.dump_stats("main_profiler.stats")

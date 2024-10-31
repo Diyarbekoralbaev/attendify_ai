@@ -72,7 +72,6 @@ def calculate_rectangle_area(bbox):
     return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
 
-@lru_cache(maxsize=128)
 def compute_sim(feat1_tuple, feat2_tuple):
     """Compute similarity between two feature vectors."""
     try:
@@ -82,6 +81,7 @@ def compute_sim(feat1_tuple, feat2_tuple):
             logger.error(f"Embeddings have incorrect shapes: feat1.shape={feat1.shape}, feat2.shape={feat2.shape}")
             return None
         sim = np.dot(feat1, feat2) / (norm(feat1) * norm(feat2))
+        sim = min(max(sim, -1.0), 1.0)  # Cap similarity
         return sim
     except Exception as e:
         logger.error(e)

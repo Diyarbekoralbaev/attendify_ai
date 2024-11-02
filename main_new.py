@@ -16,9 +16,76 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 from datetime import datetime
 from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
-from bson.binary import Binary
 
 load_dotenv()
+
+
+import asyncio
+import websockets
+import json
+
+async def websocket_listener(db_manager, face_processor):
+    uri = f"{Config.API_BASE_URL.replace('http', 'ws')}/ws"
+
+    async with websockets.connect(uri) as websocket:
+        Config.logger.info("Connected to WebSocket server.")
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+                Config.logger.info(f"Received data via WebSocket: {data}")
+
+                # Handle the data (e.g., 'employee_update' or 'client_update')
+                if data['event'] == 'employee_update':
+                    await handle_employee_update(data['data'], db_manager, face_processor)
+                elif data['event'] == 'client_update':
+                    await handle_client_update(data['data'], db_manager, face_processor)
+                elif data['event'] == 'employee_delete':
+                    await handle_employee_removed(data['data']['id'], db_manager)
+                elif data['event'] == 'client_delete':
+                    await handle_client_removed(data['data']['id'], db_manager)
+                else:
+                    Config.logger.warning(f"Unknown data type received: {data['type']}")
+
+            except websockets.ConnectionClosed:
+                Config.logger.error("WebSocket connection closed. Reconnecting...")
+                await asyncio.sleep(5)  # Wait before reconnecting
+                return await websocket_listener(db_manager, face_processor)
+            except Exception as e:
+                Config.logger.error(f"Error in WebSocket listener: {e}")
+                await asyncio.sleep(1)
+
+
+async def handle_employee_update(employee_data, db_manager, face_processor):
+    person_id = employee_data['id']
+    image_url = f"{Config.API_BASE_URL}/{employee_data['image']}"
+    embedding = get_embedding_from_url(image_url, face_processor)
+    if embedding is not None:
+        db_manager.add_employee_embedding(person_id, embedding)
+        Config.logger.info(f"Updated embedding for Employee ID: {person_id}")
+    else:
+        Config.logger.error(f"Failed to get embedding for Employee ID: {person_id}")
+
+async def handle_client_update(client_data, db_manager, face_processor):
+    person_id = client_data['id']
+    image_url = f"{Config.API_BASE_URL}/{client_data['image']}"
+    embedding = get_embedding_from_url(image_url, face_processor)
+    if embedding is not None:
+        db_manager.add_client_embedding(person_id, embedding)
+        Config.logger.info(f"Updated embedding for Client ID: {person_id}")
+    else:
+        Config.logger.error(f"Failed to get embedding for Client ID: {person_id}")
+
+async def handle_employee_removed(employee_id, db_manager):
+    person_id = employee_id
+    db_manager.remove_employee_embedding(person_id)
+    Config.logger.info(f"Removed embedding for Employee ID: {person_id}")
+
+
+async def handle_client_removed(client_id, db_manager):
+    person_id = client_id
+    db_manager.remove_client_embedding(person_id)
+    Config.logger.info(f"Removed embedding for Client ID: {person_id}")
 
 # Configuration Class
 class Config:
@@ -34,6 +101,11 @@ class Config:
     API_TOKEN = os.getenv('API_TOKEN', 'your_api_token_here')  # Ensure this is set in your .env
     IMAGES_FOLDER = os.getenv('IMAGES_FOLDER', '/path/to/images')  # Update with your images folder path
     FETCH_STORE_INTERVAL = int(os.getenv('FETCH_STORE_INTERVAL', 300))  # Interval in seconds
+
+    DEFAULT_AGE = int(os.getenv('DEFAULT_AGE', 30))
+    DEFAULT_GENDER = int(os.getenv('DEFAULT_GENDER', 0))  # 0 for female, 1 for male
+
+    REPORT_COOLDOWN_SECONDS = int(os.getenv('REPORT_COOLDOWN_SECONDS', 60))  # Cooldown period for sending reports
 
 # Database and Faiss Index Management
 class DatabaseManager:
@@ -88,7 +160,7 @@ class DatabaseManager:
             if employee_embeddings:
                 employee_embeddings = np.array(employee_embeddings)
                 faiss.normalize_L2(employee_embeddings)  # Ensure normalization
-                self.faiss_index_employee.add(employee_embeddings)
+                self.faiss_index_employee.add(employee_embeddings) # noqa
                 Config.logger.info(f"Loaded {len(employee_embeddings)} employee embeddings into Faiss index.")
             else:
                 Config.logger.warning("No employee embeddings loaded into Faiss index.")
@@ -112,13 +184,13 @@ class DatabaseManager:
             if client_embeddings:
                 client_embeddings = np.array(client_embeddings)
                 faiss.normalize_L2(client_embeddings)  # Ensure normalization
-                self.faiss_index_client.add(client_embeddings)
+                self.faiss_index_client.add(client_embeddings) # noqa
                 Config.logger.info(f"Loaded {len(client_embeddings)} client embeddings into Faiss index.")
             else:
                 Config.logger.warning("No client embeddings loaded into Faiss index.")
 
     def add_employee_embedding(self, person_id, embedding):
-        with self.lock:
+        with self.lock: # noqa
             norm = np.linalg.norm(embedding)
             if norm == 0:
                 Config.logger.error(f"Cannot add employee {person_id} with zero norm embedding.")
@@ -128,11 +200,11 @@ class DatabaseManager:
                 {"person_id": person_id},
                 {"$set": {
                     "embedding": embedding.tolist(),
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now()
                 }},
                 upsert=True
             )
-            self.faiss_index_employee.add(np.array([embedding]).astype('float32'))
+            self.faiss_index_employee.add(np.array([embedding]).astype('float32')) # noqa
             self.employee_ids.append(person_id)
             self.employee_embeddings_map[person_id] = embedding
             Config.logger.info(f"Stored/Updated embedding for Employee ID: {person_id}")
@@ -148,14 +220,35 @@ class DatabaseManager:
                 {"person_id": person_id},
                 {"$set": {
                     "embedding": embedding.tolist(),
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now()
                 }},
                 upsert=True
             )
-            self.faiss_index_client.add(np.array([embedding]).astype('float32'))
+            self.faiss_index_client.add(np.array([embedding]).astype('float32')) # noqa
             self.client_ids.append(person_id)
             self.client_embeddings_map[person_id] = embedding
             Config.logger.info(f"Stored/Updated embedding for Client ID: {person_id}")
+
+    def remove_employee_embedding(self, person_id):
+        with self.lock:
+            self.employees_collection.delete_one({"person_id": person_id})
+            if person_id in self.employee_ids:
+                self.employee_ids.remove(person_id)
+                Config.logger.info(f"Removed Employee ID: {person_id}")
+            else:
+                Config.logger.warning(f"Employee ID {person_id} not found in employee IDs.")
+            if person_id in self.employee_embeddings_map:
+                self.employee_embeddings_map.pop(person_id, None)
+
+    def remove_client_embedding(self, person_id):
+        with self.lock:
+            self.clients_collection.delete_one({"person_id": person_id})
+            if person_id in self.client_ids:
+                self.client_ids.remove(person_id)
+                Config.logger.info(f"Removed Client ID: {person_id}")
+            self.client_embeddings_map.pop(person_id, None)
+            self.faiss_index_client.remove_ids([self.client_ids.index(person_id)])
+            Config.logger.info(f"Removed embedding for Client ID: {person_id}")
 
     def remove_deleted_employees(self, fetched_employee_ids):
         with self.lock:
@@ -189,7 +282,7 @@ class DatabaseManager:
         with self.lock:
             if self.faiss_index_employee.ntotal == 0:
                 return None, 0
-            D, I = self.faiss_index_employee.search(np.array([embedding]).astype('float32'), k=1)
+            D, I = self.faiss_index_employee.search(np.array([embedding]).astype('float32'), k=1) # noqa
             if I[0][0] == -1:
                 return None, 0
             similarity = float(D[0][0])  # Cosine similarity
@@ -214,7 +307,7 @@ class DatabaseManager:
         with self.lock:
             if self.faiss_index_client.ntotal == 0:
                 return None, 0
-            D, I = self.faiss_index_client.search(np.array([embedding]).astype('float32'), k=1)
+            D, I = self.faiss_index_client.search(np.array([embedding]).astype('float32'), k=1) # noqa
             if I[0][0] == -1:
                 return None, 0
             similarity = float(D[0][0])  # Cosine similarity
@@ -245,7 +338,7 @@ class FaceProcessor:
     def get_embedding_from_image(self, image):
         faces = self.app.get(image)
         if not faces:
-            return None
+            return None, None, None
         # Get the face with the highest detection score
         face = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
         if face:
@@ -255,11 +348,14 @@ class FaceProcessor:
             Config.logger.debug(f"Embedding norm: {norm}")
             if norm == 0:
                 Config.logger.warning("Detected face has zero norm embedding.")
-                return None
+                return None, None, None
             embedding = embedding / norm
             Config.logger.debug(f"Normalized embedding: {embedding}")
-            return embedding
-        return None
+            age = getattr(face, 'age', None)
+            gender = getattr(face, 'gender', None)
+            return embedding, age, gender
+        return None, None, None
+
 
 # API Interaction Functions
 def save_attendance_to_api(person_id, device_id, image_path, timestamp, score):
@@ -356,9 +452,9 @@ def send_report_json(endpoint, data=None, headers=None):
     except requests.RequestException as e:
         # Attempt to log the response content for detailed error information
         try:
-            error_content = response.json()
+            error_content = response.json() # noqa
             Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}, Response: {error_content}")
-        except:
+        except Exception as e:
             Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}")
         return None
 
@@ -375,7 +471,7 @@ def send_report_with_response(endpoint, data=None, files=None, params=None, head
         return None
 
 # Image Processing Function
-def process_image(file_path, camera_id, db_manager, face_processor):
+def process_image(file_path, camera_id, db_manager, face_processor, employee_last_report_times, client_last_report_times, lock):
     Config.logger.info(f"Processing image: {file_path} from camera_id: {camera_id}")
     try:
         image = cv2.imread(file_path)
@@ -386,49 +482,85 @@ def process_image(file_path, camera_id, db_manager, face_processor):
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_resized = cv2.resize(image_rgb, Config.DET_SIZE)
 
-        embedding = face_processor.get_embedding_from_image(image_resized)
+        embedding, age, gender = face_processor.get_embedding_from_image(image_resized)
         if embedding is None:
             Config.logger.error(f"No face embedding found in image: {file_path}")
             return
+
+        if age is None:
+            age = Config.DEFAULT_AGE
+        else:
+            age = int(round(age))
+
+        if gender is None:
+            gender = Config.DEFAULT_GENDER
+        else:
+            gender = int(round(gender))
 
         timestamp = extract_date_from_filename(os.path.basename(file_path))
         if not timestamp:
             Config.logger.error(f"Could not extract date from filename: {file_path}")
             return
 
-        # Construct image URL based on known pattern
-        image_url = f"http://10.30.10.136:8000/uploads/{os.path.basename(file_path)}"
-
         # Search for matching employee
         employee, similarity_emp = db_manager.find_matching_employee(embedding)
         if employee:
-            save_attendance_to_api(
-                person_id=employee['person_id'],
-                device_id=camera_id,
-                image_path=file_path,
-                timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                score=similarity_emp
-            )
-            return
+            person_id = employee['person_id']
+            with lock:
+                last_report_time = employee_last_report_times.get(person_id)
+                current_time = datetime.now()
+                if last_report_time and (current_time - last_report_time).total_seconds() < Config.REPORT_COOLDOWN_SECONDS:
+                    Config.logger.info(f"Employee {person_id} was seen {current_time - last_report_time} ago. Skipping attendance report.")
+                    return
+                else:
+                    save_attendance_to_api(
+                        person_id=employee['person_id'],
+                        device_id=camera_id,
+                        image_path=file_path,
+                        timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                        score=similarity_emp
+                    )
+                    employee_last_report_times[person_id] = current_time
+                    return
 
-        # Search for matching client
+        # After matching a client
         client, similarity_cli = db_manager.find_matching_client(embedding)
         if client:
-            update_client_via_api(
-                client_id=client['person_id'],
-                datetime_str=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                device_id=camera_id
-            )
-            logging.info(f"Client {client['person_id']} visited with similarity {similarity_cli}")
+            person_id = client['person_id']
+            with lock:
+                last_report_time = client_last_report_times.get(person_id)
+                current_time = datetime.now()
+                if last_report_time and (current_time - last_report_time).total_seconds() < Config.REPORT_COOLDOWN_SECONDS:
+                    Config.logger.info(f"Client {person_id} was seen {current_time - last_report_time} ago. Skipping visit history update.")
+                    return
+                else:
+                    # Send visit history update
+                    update_client_via_api(
+                        client_id=person_id,
+                        datetime_str=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                        device_id=camera_id
+                    )
+                    # Update last report time
+                    client_last_report_times[person_id] = current_time
+                    Config.logger.info(f"Client {person_id} visited with similarity {similarity_cli}")
             return
+
+
+            # update_client_via_api(
+            #     client_id=client['person_id'],
+            #     datetime_str=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            #     device_id=camera_id
+            # )
+            # logging.info(f"Client {client['person_id']} visited with similarity {similarity_cli}")
+            # return
 
         # If no match found, create new client
         new_client_id = create_client_via_api(
             image_path=file_path,
             first_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             last_seen=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            gender=int(0),  # Placeholder, replace with actual gender extraction if available
-            age=int(30)      # Placeholder, replace with actual age extraction if available
+            gender=gender,
+            age=age
         )
 
         if new_client_id:
@@ -496,7 +628,7 @@ def fetch_and_store_data(db_manager, face_processor):
                             "visit_count": client.get('visit_count', 1),
                             "gender": client.get('gender'),
                             "age": client.get('age'),
-                            "updated_at": datetime.utcnow()
+                            "updated_at": datetime.now()
                         }},
                         upsert=True
                     )
@@ -528,7 +660,7 @@ def get_embedding_from_url(image_url, face_processor):
             Config.logger.error(f"Failed to decode image from URL: {image_url}")
             return None
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        embedding = face_processor.get_embedding_from_image(image_rgb)
+        embedding, age, gender = face_processor.get_embedding_from_image(image_rgb)
         if embedding is None:
             Config.logger.warning(f"No faces detected in image from URL: {image_url}")
             return None
@@ -537,26 +669,38 @@ def get_embedding_from_url(image_url, face_processor):
         Config.logger.error(f"Error fetching or processing image from URL {image_url}: {e}")
         return None
 
-# Periodic Task Scheduler
-def schedule_fetch_and_store(db_manager, face_processor, interval):
-    while True:
-        fetch_and_store_data(db_manager, face_processor)
-        time.sleep(interval)
+# # Periodic Task Scheduler
+# def schedule_fetch_and_store(db_manager, face_processor, interval):
+#     while True:
+#         fetch_and_store_data(db_manager, face_processor)
+#         time.sleep(interval)
 
 # Image Handler for Watchdog
 class ImageHandler(FileSystemEventHandler):
-    def __init__(self, executor, db_manager, face_processor, logger):
+    def __init__(self, executor, db_manager, face_processor, logger, employee_last_report_times, client_last_report_times, lock):
         super().__init__()
         self.executor = executor
         self.db_manager = db_manager
         self.face_processor = face_processor
         self.logger = logger
+        self.employee_last_report_times = employee_last_report_times
+        self.client_last_report_times = client_last_report_times
+        self.lock = lock
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith('SNAP.jpg'):
             self.logger.info(f"New image detected: {event.src_path}")
             # Dispatch a thread to process the image
-            self.executor.submit(process_image, event.src_path, camera_id=1, db_manager=self.db_manager, face_processor=self.face_processor)
+            self.executor.submit(
+                process_image,
+                event.src_path,
+                camera_id=1,
+                db_manager=self.db_manager,
+                face_processor=self.face_processor,
+                employee_last_report_times=self.employee_last_report_times,
+                client_last_report_times=self.client_last_report_times,
+                lock=self.lock
+            )
 
 # Main Runner Class
 class MainRunner:
@@ -566,10 +710,24 @@ class MainRunner:
         self.face_processor = FaceProcessor()
         self.executor = ThreadPoolExecutor(max_workers=10)  # Adjust the number of workers as needed
         self.logger = Config.logger
+        self.employee_last_report_times = {}
+        self.client_last_report_times = {}
+        self.lock = threading.Lock()
+
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
 
     def run(self):
         self.logger.info(f"Starting directory observer for: {self.images_folder}")
-        event_handler = ImageHandler(self.executor, self.db_manager, self.face_processor, self.logger)
+        event_handler = ImageHandler(
+            self.executor,
+            self.db_manager,
+            self.face_processor,
+            self.logger,
+            self.employee_last_report_times,
+            self.client_last_report_times,
+            self.lock
+        )
         observer = Observer()
         test_camera_dir = os.path.join(self.images_folder, 'test_camera')
         os.makedirs(test_camera_dir, exist_ok=True)
@@ -577,8 +735,13 @@ class MainRunner:
         observer.start()
 
         # Start the periodic fetch_and_store_data in a separate thread
-        fetch_thread = threading.Thread(target=schedule_fetch_and_store, args=(self.db_manager, self.face_processor, Config.FETCH_STORE_INTERVAL), daemon=True)
+        fetch_thread = threading.Thread(target=fetch_and_store_data, args=(self.db_manager, self.face_processor), daemon=True)
         fetch_thread.start()
+
+        # Start the WebSocket listener in a separate thread
+        ws_thread = threading.Thread(target=self.start_websocket_listener, daemon=True)
+        logging.info("Starting WebSocket listener.")
+        ws_thread.start()
 
         try:
             while True:
@@ -588,6 +751,10 @@ class MainRunner:
             observer.stop()
         observer.join()
         self.executor.shutdown(wait=True)
+
+    def start_websocket_listener(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(websocket_listener(self.db_manager, self.face_processor))
 
 # Entry Point
 if __name__ == '__main__':

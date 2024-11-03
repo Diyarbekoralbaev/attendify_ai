@@ -1,17 +1,16 @@
-# camera_capture.py
-
+# camera_capture_headless.py
 import cv2
 import os
-from datetime import datetime, timedelta
 import numpy as np
-from insightface.app import FaceAnalysis
-import time
-from dotenv import load_dotenv
+import logging
 import threading
 import queue
-import logging
-from deep_sort_realtime.deepsort_tracker import DeepSort
 import concurrent.futures
+from datetime import datetime, timedelta
+from insightface.app import FaceAnalysis
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
@@ -79,7 +78,7 @@ class CameraCapture:
         for attempt in range(max_retries):
             try:
                 logging.info(f"Attempting to initialize IP camera, attempt {attempt + 1}")
-                camera = cv2.VideoCapture(0)  # Update as per your camera source
+                camera = cv2.VideoCapture(phone_camera_url)
 
                 if camera.isOpened():
                     ret, frame = camera.read()
@@ -164,10 +163,8 @@ class CameraCapture:
                     continue  # Skip frame
 
                 original_height, original_width = frame.shape[:2]
-                resized_frame = cv2.resize(frame, (320, 240))  # Reduced resolution
-
-                # Optionally enhance sharpness
-                # resized_frame = self.enhance_sharpness(resized_frame)
+                # resize frame for max quality
+                resized_frame = cv2.resize(frame, (320, 240))
 
                 faces = self.face_analyzer.get(resized_frame)
 
@@ -179,9 +176,9 @@ class CameraCapture:
                     yaw, pitch, roll = face.pose
 
                     # Set thresholds for yaw and pitch
-                    yaw_threshold = 15  # degrees
-                    pitch_threshold = 15  # degrees
-                    roll_threshold = 15  # degrees
+                    yaw_threshold = 45  # degrees
+                    pitch_threshold = 45  # degrees
+                    roll_threshold = 45  # degrees
 
                     # Check if the face is frontal
                     if (abs(yaw) > yaw_threshold or
@@ -198,11 +195,9 @@ class CameraCapture:
 
                     # Estimate distance
                     distance = self.estimate_distance(w, h)
-                    # logging.info(f"Estimated distance for face: {distance:.2f} meters")
 
-                    # Only proceed if within 3 meters
+                    # Only proceed if within reference distance
                     if distance > self.reference_distance:
-                        # logging.info(f"Face at {distance:.2f} meters is outside the 3-meter range. Skipping.")
                         continue
 
                     detections.append(([x, y, w, h], face.det_score, face.embedding))
@@ -210,7 +205,6 @@ class CameraCapture:
                 # Update tracker with current detections
                 tracks = self.tracker.update_tracks(detections, frame=resized_frame)
 
-                display_frame = frame.copy()
                 for track in tracks:
                     if not track.is_confirmed():
                         continue
@@ -234,36 +228,21 @@ class CameraCapture:
 
                     # Calculate sharpness
                     sharpness = self.calculate_image_sharpness(face_frame)
-                    # logging.info(f"Calculated sharpness for track {track_id}: {sharpness:.2f}")
 
                     if sharpness < self.min_quality_score:
-                        # logging.info(f"Face too blurry (sharpness: {sharpness:.2f}). Skipping.")
                         continue
 
                     # Check cooldown
                     current_time = datetime.now()
                     last_capture = self.last_capture_times.get(track_id, datetime.min)
                     if (current_time - last_capture) >= self.cooldown_period:
-                        self.save_detection_async(display_frame, face_frame, track_id)
+                        self.save_detection_async(frame, face_frame, track_id)
                         self.last_capture_times[track_id] = current_time
-                        color = (0, 255, 0)  # Green for new capture
+                        logging.info(f"Captured and saved detection for person {track_id}")
                     else:
-                        color = (0, 0, 255)  # Red if within cooldown
+                        logging.info(f"Person {track_id} is within cooldown period. Skipping capture.")
 
-                    # Draw bounding box and label (Commented out since we're not displaying)
-                    # cv2.rectangle(display_frame, (x1_orig, y1_orig), (x2_orig, y2_orig), color, 2)
-                    # cv2.putText(display_frame, f"Person {track_id}", (x1_orig, y1_orig - 10),
-                    #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                # Log the number of faces detected within 3 meters
-                logging.info(f"Faces within {self.reference_distance}m: {len(tracks)}")
-
-                # Remove cv2.imshow and cv2.waitKey since we're running headless
-                # cv2.imshow('Camera Feed', display_frame)
-
-                # if cv2.waitKey(1) & 0xFF == ord('q'):
-                #     logging.info("Exit signal received. Shutting down.")
-                #     break
+                # Since we're running headless, we don't need to display the frame
 
             except Exception as e:
                 logging.error(f"Error processing frame: {e}")
@@ -288,7 +267,7 @@ class CameraCapture:
         self.process_frame()
         grabber_thread.join()
         self.executor.shutdown(wait=True)
-        # cv2.destroyAllWindows()  # Not needed in headless mode
+        # No need to call cv2.destroyAllWindows() since we are not creating any windows
 
 if __name__ == "__main__":
     try:
@@ -297,6 +276,4 @@ if __name__ == "__main__":
     except Exception as e:
         logging.fatal(f"Fatal error: {e}")
         import traceback
-
         traceback.print_exc()
-        # cv2.destroyAllWindows()  # Not needed in headless mode

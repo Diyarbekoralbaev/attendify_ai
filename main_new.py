@@ -38,14 +38,14 @@ async def websocket_listener(db_manager, face_processor):
                 # Handle the data (e.g., 'employee_update' or 'client_update')
                 if data['event'] == 'employee_update':
                     await handle_employee_update(data['data'], db_manager, face_processor)
-                elif data['event'] == 'client_update':
-                    await handle_client_update(data['data'], db_manager, face_processor)
+                # elif data['event'] == 'client_update':
+                #     await handle_client_update(data['data'], db_manager, face_processor)
                 elif data['event'] == 'employee_delete':
                     await handle_employee_removed(data['data']['id'], db_manager)
                 elif data['event'] == 'client_delete':
                     await handle_client_removed(data['data']['id'], db_manager)
                 else:
-                    Config.logger.warning(f"Unknown data type received: {data['type']}")
+                    Config.logger.warning(f"Unknown data type received: {data['event']}")
 
             except websockets.ConnectionClosed:
                 Config.logger.error("WebSocket connection closed. Reconnecting...")
@@ -93,14 +93,12 @@ class Config:
     EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.5))  # Similarity threshold for employees
     MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))  # Minimum detection confidence for faces
     DET_SCORE_THRESH = float(os.getenv('DET_SCORE_THRESH', 0.65))
-    POSE_THRESHOLD = float(os.getenv('POSE_THRESHOLD', 40))
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
     DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
     API_BASE_URL = os.getenv('API_BASE_URL', 'http://10.30.10.136:8000')
     API_TOKEN = os.getenv('API_TOKEN', 'your_api_token_here')  # Ensure this is set in your .env
     IMAGES_FOLDER = os.getenv('IMAGES_FOLDER', '/path/to/images')  # Update with your images folder path
-    FETCH_STORE_INTERVAL = int(os.getenv('FETCH_STORE_INTERVAL', 300))  # Interval in seconds
 
     DEFAULT_AGE = int(os.getenv('DEFAULT_AGE', 30))
     DEFAULT_GENDER = int(os.getenv('DEFAULT_GENDER', 0))  # 0 for female, 1 for male
@@ -242,13 +240,23 @@ class DatabaseManager:
 
     def remove_client_embedding(self, person_id):
         with self.lock:
-            self.clients_collection.delete_one({"person_id": person_id})
+            Config.logger.info(f"Before removing client from faiss index: {self.client_ids}")
+
+            # Attempt to retrieve the index of the client ID before deletion
             if person_id in self.client_ids:
+                index = self.client_ids.index(person_id)
+                self.clients_collection.delete_one({"person_id": person_id})
                 self.client_ids.remove(person_id)
-                Config.logger.info(f"Removed Client ID: {person_id}")
-            self.client_embeddings_map.pop(person_id, None)
-            self.faiss_index_client.remove_ids([self.client_ids.index(person_id)])
-            Config.logger.info(f"Removed embedding for Client ID: {person_id}")
+                self.client_embeddings_map.pop(person_id, None)
+
+                # Remove from Faiss index using the index
+                try:
+                    self.faiss_index_client.remove_ids(np.array([index]))
+                    Config.logger.info(f"Removed embedding for Client ID: {person_id}")
+                except Exception as e:
+                    Config.logger.error(f"Error removing embedding from Faiss index: {e}")
+            else:
+                Config.logger.warning(f"Client ID {person_id} not found in client IDs.")
 
     def remove_deleted_employees(self, fetched_employee_ids):
         with self.lock:
@@ -332,7 +340,7 @@ class DatabaseManager:
 class FaceProcessor:
     def __init__(self):
         # Initialize FaceAnalysis with desired models
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use CPU only
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])  # Use CPU only
         self.app.prepare(ctx_id=-1, det_size=Config.DET_SIZE)
 
     def get_embedding_from_image(self, image):

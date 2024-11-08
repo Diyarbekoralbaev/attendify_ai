@@ -2,6 +2,7 @@
 
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import cv2
 import numpy as np
@@ -10,9 +11,6 @@ from insightface.app import FaceAnalysis
 from pymongo import MongoClient
 import requests
 import faiss
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from concurrent.futures import ThreadPoolExecutor
 import logging
 from datetime import datetime
 from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup_logger
@@ -23,72 +21,11 @@ import asyncio
 import websockets
 import json
 
-async def websocket_listener(db_manager, face_processor):
-    uri = f"{Config.API_BASE_URL.replace('http', 'ws')}/ws"
-
-    async with websockets.connect(uri) as websocket:
-        Config.logger.info("Connected to WebSocket server.")
-        while True:
-            try:
-                message = await websocket.recv()
-                data = json.loads(message)
-                Config.logger.info(f"Received data via WebSocket: {data}")
-
-                # Handle the data (e.g., 'employee_update' or 'client_update')
-                if data['event'] == 'employee_update':
-                    await handle_employee_update(data['data'], db_manager, face_processor)
-                elif data['event'] == 'employee_delete':
-                    await handle_employee_removed(data['data']['id'], db_manager)
-                elif data['event'] == 'client_delete':
-                    await handle_client_removed(data['data']['id'], db_manager)
-                else:
-                    Config.logger.warning(f"Unknown data type received: {data['event']}")
-
-            except websockets.ConnectionClosed:
-                Config.logger.error("WebSocket connection closed. Reconnecting...")
-                await asyncio.sleep(5)  # Wait before reconnecting
-                return await websocket_listener(db_manager, face_processor)
-            except Exception as e:
-                Config.logger.error(f"Error in WebSocket listener: {e}")
-                await asyncio.sleep(1)
-
-
-async def handle_employee_update(employee_data, db_manager, face_processor):
-    person_id = employee_data['id']
-    image_url = f"{Config.API_BASE_URL}/{employee_data['image']}"
-    embedding = get_embedding_from_url(image_url, face_processor)
-    if embedding is not None:
-        db_manager.add_employee_embedding(person_id, embedding)
-        Config.logger.info(f"Updated embedding for Employee ID: {person_id}")
-    else:
-        Config.logger.error(f"Failed to get embedding for Employee ID: {person_id}")
-
-async def handle_client_update(client_data, db_manager, face_processor):
-    person_id = client_data['id']
-    image_url = f"{Config.API_BASE_URL}/{client_data['image']}"
-    embedding = get_embedding_from_url(image_url, face_processor)
-    if embedding is not None:
-        db_manager.add_client_embedding(person_id, embedding)
-        Config.logger.info(f"Updated embedding for Client ID: {person_id}")
-    else:
-        Config.logger.error(f"Failed to get embedding for Client ID: {person_id}")
-
-async def handle_employee_removed(employee_id, db_manager):
-    person_id = employee_id
-    db_manager.remove_employee_embedding(person_id)
-    Config.logger.info(f"Removed embedding for Employee ID: {person_id}")
-
-
-async def handle_client_removed(client_id, db_manager):
-    person_id = client_id
-    db_manager.remove_client_embedding(person_id)
-    Config.logger.info(f"Removed embedding for Client ID: {person_id}")
-
 # Configuration Class
 class Config:
-    CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.7))  # Adjusted similarity threshold for clients
-    EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.7))  # Adjusted similarity threshold for employees
-    MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))  # Minimum detection confidence for faces
+    CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.7))
+    EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.7))
+    MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
     DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
@@ -103,6 +40,9 @@ class Config:
 
     # Added POSE_THRESHOLD
     POSE_THRESHOLD = int(os.getenv('POSE_THRESHOLD', 30))  # Pose angle threshold
+
+    # Network timeout in seconds
+    NETWORK_TIMEOUT = int(os.getenv('NETWORK_TIMEOUT', 10))  # Timeout for network requests
 
 # Database and Faiss Index Management
 class DatabaseManager:
@@ -419,7 +359,7 @@ def create_client_via_api(image_path, first_seen, last_seen, gender, age):
 def send_report(endpoint, data=None, files=None, headers=None):
     url = f"{Config.API_BASE_URL}{endpoint}"
     try:
-        response = requests.post(url, data=data, files=files, headers=headers)
+        response = requests.post(url, data=data, files=files, headers=headers, timeout=Config.NETWORK_TIMEOUT)
         response.raise_for_status()
         Config.logger.info(f"Successfully sent report to {endpoint}")
         return response
@@ -431,7 +371,7 @@ def send_report_json(endpoint, data=None, headers=None):
     """Send JSON report to FastAPI API"""
     url = f"{Config.API_BASE_URL}{endpoint}"
     try:
-        response = requests.post(url, json=data, headers=headers)
+        response = requests.post(url, json=data, headers=headers, timeout=Config.NETWORK_TIMEOUT)
         response.raise_for_status()
         Config.logger.info(f"Successfully sent JSON report to {endpoint}")
         return response
@@ -448,7 +388,7 @@ def send_report_with_response(endpoint, data=None, files=None, params=None, head
     """Send report and return the response object"""
     url = f"{Config.API_BASE_URL}{endpoint}"
     try:
-        response = requests.post(url, data=data, files=files, params=params, headers=headers)
+        response = requests.post(url, data=data, files=files, params=params, headers=headers, timeout=Config.NETWORK_TIMEOUT)
         response.raise_for_status()
         Config.logger.info(f"Successfully sent report to {endpoint}")
         return response
@@ -550,12 +490,16 @@ def process_image(file_path, camera_id, db_manager, face_processor, employee_las
         Config.logger.error(f"Error processing image {file_path}: {e}")
     finally:
         # Clean up the processed file
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        # Remove corresponding BACKGROUND file if it exists
-        bg_file = file_path.replace('SNAP', 'BACKGROUND')
-        if os.path.exists(bg_file):
-            os.remove(bg_file)
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            # Remove corresponding BACKGROUND file if it exists
+            bg_file = file_path.replace('SNAP', 'BACKGROUND')
+            if os.path.exists(bg_file):
+                os.remove(bg_file)
+            Config.logger.info(f"Removed processed image and background: {file_path}, {bg_file}")
+        except Exception as e:
+            Config.logger.error(f"Error removing files in finally block: {e}")
 
 # Fetch and Store Data Function
 def fetch_and_store_data(db_manager, face_processor):
@@ -564,7 +508,7 @@ def fetch_and_store_data(db_manager, face_processor):
     try:
         headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
         # Fetch Employees
-        employees_response = requests.get(f"{Config.API_BASE_URL}/employee/employees", headers=headers)
+        employees_response = requests.get(f"{Config.API_BASE_URL}/employee/employees", headers=headers, timeout=Config.NETWORK_TIMEOUT)
         employees_response.raise_for_status()
         employees = employees_response.json()
 
@@ -583,7 +527,7 @@ def fetch_and_store_data(db_manager, face_processor):
         db_manager.remove_deleted_employees(fetched_employee_ids)
 
         # Fetch Clients
-        clients_response = requests.get(f"{Config.API_BASE_URL}/client/clients", headers=headers)
+        clients_response = requests.get(f"{Config.API_BASE_URL}/client/clients", headers=headers, timeout=Config.NETWORK_TIMEOUT)
         clients_response.raise_for_status()
         clients = clients_response.json()
 
@@ -609,7 +553,7 @@ def fetch_and_store_data(db_manager, face_processor):
 def get_embedding_from_url(image_url, face_processor):
     try:
         headers = {'Authorization': f'Bearer {Config.API_TOKEN}'}
-        response = requests.get(image_url, headers=headers)
+        response = requests.get(image_url, headers=headers, timeout=Config.NETWORK_TIMEOUT)
         response.raise_for_status()
         image_array = np.frombuffer(response.content, np.uint8)
         image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -626,32 +570,55 @@ def get_embedding_from_url(image_url, face_processor):
         Config.logger.error(f"Error fetching or processing image from URL {image_url}: {e}")
         return None
 
-# Image Handler for Watchdog
-class ImageHandler(FileSystemEventHandler):
-    def __init__(self, executor, db_manager, face_processor, logger, employee_last_report_times, client_last_report_times, lock):
-        super().__init__()
-        self.executor = executor
-        self.db_manager = db_manager
-        self.face_processor = face_processor
-        self.logger = logger
-        self.employee_last_report_times = employee_last_report_times
-        self.client_last_report_times = client_last_report_times
-        self.lock = lock
+# WebSocket Listener Functions
+async def websocket_listener(db_manager, face_processor):
+    uri = f"{Config.API_BASE_URL.replace('http', 'ws')}/ws"
 
-    def on_created(self, event):
-        if not event.is_directory and event.src_path.endswith('SNAP.jpg'):
-            self.logger.info(f"New image detected: {event.src_path}")
-            # Dispatch a thread to process the image
-            self.executor.submit(
-                process_image,
-                event.src_path,
-                camera_id=1,
-                db_manager=self.db_manager,
-                face_processor=self.face_processor,
-                employee_last_report_times=self.employee_last_report_times,
-                client_last_report_times=self.client_last_report_times,
-                lock=self.lock
-            )
+    async with websockets.connect(uri) as websocket:
+        Config.logger.info("Connected to WebSocket server.")
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+                Config.logger.info(f"Received data via WebSocket: {data}")
+
+                # Handle the data (e.g., 'employee_update' or 'client_update')
+                if data['event'] == 'employee_update':
+                    await handle_employee_update(data['data'], db_manager, face_processor)
+                elif data['event'] == 'employee_delete':
+                    await handle_employee_removed(data['data']['id'], db_manager)
+                elif data['event'] == 'client_delete':
+                    await handle_client_removed(data['data']['id'], db_manager)
+                else:
+                    Config.logger.warning(f"Unknown data type received: {data['event']}")
+
+            except websockets.ConnectionClosed:
+                Config.logger.error("WebSocket connection closed. Reconnecting...")
+                await asyncio.sleep(5)  # Wait before reconnecting
+                return await websocket_listener(db_manager, face_processor)
+            except Exception as e:
+                Config.logger.error(f"Error in WebSocket listener: {e}")
+                await asyncio.sleep(1)
+
+async def handle_employee_update(employee_data, db_manager, face_processor):
+    person_id = employee_data['id']
+    image_url = f"{Config.API_BASE_URL}/{employee_data['image']}"
+    embedding = get_embedding_from_url(image_url, face_processor)
+    if embedding is not None:
+        db_manager.add_employee_embedding(person_id, embedding)
+        Config.logger.info(f"Updated embedding for Employee ID: {person_id}")
+    else:
+        Config.logger.error(f"Failed to get embedding for Employee ID: {person_id}")
+
+async def handle_client_removed(client_id, db_manager):
+    person_id = client_id
+    db_manager.remove_client_embedding(person_id)
+    Config.logger.info(f"Removed embedding for Client ID: {person_id}")
+
+async def handle_employee_removed(employee_id, db_manager):
+    person_id = employee_id
+    db_manager.remove_employee_embedding(person_id)
+    Config.logger.info(f"Removed embedding for Employee ID: {person_id}")
 
 # Main Runner Class
 class MainRunner:
@@ -669,22 +636,7 @@ class MainRunner:
         asyncio.set_event_loop(self.loop)
 
     def run(self):
-        self.logger.info(f"Starting directory observer for: {self.images_folder}")
-        event_handler = ImageHandler(
-            self.executor,
-            self.db_manager,
-            self.face_processor,
-            self.logger,
-            self.employee_last_report_times,
-            self.client_last_report_times,
-            self.lock
-        )
-        observer = Observer()
-        test_camera_dir = os.path.join(self.images_folder, 'test_camera')
-        os.makedirs(test_camera_dir, exist_ok=True)
-        observer.schedule(event_handler, path=test_camera_dir, recursive=False)
-        observer.start()
-
+        self.logger.info(f"Starting image processing in folder: {self.images_folder}")
         # Start the periodic fetch_and_store_data in a separate thread
         fetch_thread = threading.Thread(target=fetch_and_store_data, args=(self.db_manager, self.face_processor), daemon=True)
         fetch_thread.start()
@@ -695,12 +647,32 @@ class MainRunner:
         ws_thread.start()
 
         try:
+            processed_files = set()
             while True:
-                time.sleep(1)  # Keep the main thread alive
+                # Scan the images folder for images
+                for root, dirs, files in os.walk(self.images_folder):
+                    for file in files:
+                        if file.endswith('SNAP.jpg'):
+                            file_path = os.path.join(root, file)
+                            if file_path in processed_files:
+                                continue
+                            camera_id = 1  # or get camera_id from folder or filename
+                            self.logger.info(f"New image detected: {file_path}")
+                            processed_files.add(file_path)
+                            # Dispatch a thread to process the image
+                            self.executor.submit(
+                                process_image,
+                                file_path,
+                                camera_id=camera_id,
+                                db_manager=self.db_manager,
+                                face_processor=self.face_processor,
+                                employee_last_report_times=self.employee_last_report_times,
+                                client_last_report_times=self.client_last_report_times,
+                                lock=self.lock
+                            )
+                time.sleep(1)  # Wait a bit before scanning again
         except KeyboardInterrupt:
-            self.logger.info("Stopping directory observer.")
-            observer.stop()
-        observer.join()
+            self.logger.info("Stopping image processing.")
         self.executor.shutdown(wait=True)
 
     def start_websocket_listener(self):

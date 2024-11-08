@@ -19,7 +19,6 @@ from funcs import compute_sim, extract_date_from_filename, get_faces_data, setup
 
 load_dotenv()
 
-
 import asyncio
 import websockets
 import json
@@ -92,7 +91,6 @@ class Config:
     CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.5))  # Similarity threshold for clients
     EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.5))  # Similarity threshold for employees
     MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))  # Minimum detection confidence for faces
-    DET_SCORE_THRESH = float(os.getenv('DET_SCORE_THRESH', 0.65))
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
     DET_SIZE = tuple(map(int, os.getenv('DET_SIZE', '640,640').split(',')))
@@ -104,6 +102,9 @@ class Config:
     DEFAULT_GENDER = int(os.getenv('DEFAULT_GENDER', 0))  # 0 for female, 1 for male
 
     REPORT_COOLDOWN_SECONDS = int(os.getenv('REPORT_COOLDOWN_SECONDS', 60))  # Cooldown period for sending reports
+
+    # Added POSE_THRESHOLD
+    POSE_THRESHOLD = int(os.getenv('POSE_THRESHOLD', 30))  # Pose angle threshold
 
 # Database and Faiss Index Management
 class DatabaseManager:
@@ -350,6 +351,11 @@ class FaceProcessor:
         # Get the face with the highest detection score
         face = get_faces_data(faces, min_confidence=Config.MIN_DETECTION_CONFIDENCE)
         if face:
+            # Pose check
+            if abs(face.pose[1]) > Config.POSE_THRESHOLD or abs(face.pose[0]) > Config.POSE_THRESHOLD:
+                Config.logger.warning(f"Face pose exceeds threshold: pose={face.pose}")
+                return None, None, None
+
             embedding = face.embedding
             # Normalize embedding
             norm = np.linalg.norm(embedding)
@@ -670,18 +676,12 @@ def get_embedding_from_url(image_url, face_processor):
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         embedding, age, gender = face_processor.get_embedding_from_image(image_rgb)
         if embedding is None:
-            Config.logger.warning(f"No faces detected in image from URL: {image_url}")
+            Config.logger.warning(f"No faces detected or pose exceeds threshold in image from URL: {image_url}")
             return None
         return embedding
     except Exception as e:
         Config.logger.error(f"Error fetching or processing image from URL {image_url}: {e}")
         return None
-
-# # Periodic Task Scheduler
-# def schedule_fetch_and_store(db_manager, face_processor, interval):
-#     while True:
-#         fetch_and_store_data(db_manager, face_processor)
-#         time.sleep(interval)
 
 # Image Handler for Watchdog
 class ImageHandler(FileSystemEventHandler):

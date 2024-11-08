@@ -37,8 +37,6 @@ async def websocket_listener(db_manager, face_processor):
                 # Handle the data (e.g., 'employee_update' or 'client_update')
                 if data['event'] == 'employee_update':
                     await handle_employee_update(data['data'], db_manager, face_processor)
-                # elif data['event'] == 'client_update':
-                #     await handle_client_update(data['data'], db_manager, face_processor)
                 elif data['event'] == 'employee_delete':
                     await handle_employee_removed(data['data']['id'], db_manager)
                 elif data['event'] == 'client_delete':
@@ -88,8 +86,8 @@ async def handle_client_removed(client_id, db_manager):
 
 # Configuration Class
 class Config:
-    CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.5))  # Similarity threshold for clients
-    EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.5))  # Similarity threshold for employees
+    CHECK_NEW_CLIENT = float(os.getenv('CHECK_NEW_CLIENT', 0.7))  # Adjusted similarity threshold for clients
+    EMPLOYEE_SIMILARITY_THRESHOLD = float(os.getenv('EMPLOYEE_SIMILARITY_THRESHOLD', 0.7))  # Adjusted similarity threshold for employees
     MIN_DETECTION_CONFIDENCE = float(os.getenv('MIN_DETECTION_CONFIDENCE', 0.6))  # Minimum detection confidence for faces
     logger = setup_logger('MainRunner', 'logs/main.log')
     DIMENSIONS = int(os.getenv('DIMENSIONS', 512))
@@ -116,10 +114,9 @@ class DatabaseManager:
 
         # Initialize Faiss indexes with Inner Product for cosine similarity
         self.DIMENSIONS = Config.DIMENSIONS
-        self.faiss_index_employee = faiss.IndexFlatIP(self.DIMENSIONS)
-        self.faiss_index_client = faiss.IndexFlatIP(self.DIMENSIONS)
-        self.employee_ids = []
-        self.client_ids = []
+        # Using IndexIDMap to map custom IDs
+        self.faiss_index_employee = faiss.IndexIDMap(faiss.IndexFlatIP(self.DIMENSIONS))
+        self.faiss_index_client = faiss.IndexIDMap(faiss.IndexFlatIP(self.DIMENSIONS))
         self.lock = threading.Lock()
 
         # Maintain a mapping from person_id to embedding for compute_sim
@@ -133,15 +130,14 @@ class DatabaseManager:
             Config.logger.info("Loading Faiss indexes for employees and clients.")
 
             # Reset the indexes
-            self.faiss_index_employee.reset()
-            self.faiss_index_client.reset()
-            self.employee_ids = []
-            self.client_ids = []
+            self.faiss_index_employee = faiss.IndexIDMap(faiss.IndexFlatIP(self.DIMENSIONS))
+            self.faiss_index_client = faiss.IndexIDMap(faiss.IndexFlatIP(self.DIMENSIONS))
             self.employee_embeddings_map = {}
             self.client_embeddings_map = {}
 
             # Load employee embeddings
             employee_embeddings = []
+            employee_ids = []
             for emp in self.employees_collection.find({"embedding": {"$exists": True}}):
                 embedding = np.array(emp['embedding']).astype('float32')
                 if embedding.shape[0] != self.DIMENSIONS:
@@ -153,19 +149,20 @@ class DatabaseManager:
                     continue
                 embedding = embedding / norm  # Normalize for cosine similarity
                 employee_embeddings.append(embedding)
-                self.employee_ids.append(emp['person_id'])
+                employee_ids.append(emp['person_id'])
                 self.employee_embeddings_map[emp['person_id']] = embedding
 
             if employee_embeddings:
                 employee_embeddings = np.array(employee_embeddings)
                 faiss.normalize_L2(employee_embeddings)  # Ensure normalization
-                self.faiss_index_employee.add(employee_embeddings) # noqa
+                self.faiss_index_employee.add_with_ids(employee_embeddings, np.array(employee_ids))
                 Config.logger.info(f"Loaded {len(employee_embeddings)} employee embeddings into Faiss index.")
             else:
                 Config.logger.warning("No employee embeddings loaded into Faiss index.")
 
             # Load client embeddings
             client_embeddings = []
+            client_ids = []
             for cli in self.clients_collection.find({"embedding": {"$exists": True}}):
                 embedding = np.array(cli['embedding']).astype('float32')
                 if embedding.shape[0] != self.DIMENSIONS:
@@ -177,19 +174,19 @@ class DatabaseManager:
                     continue
                 embedding = embedding / norm  # Normalize for cosine similarity
                 client_embeddings.append(embedding)
-                self.client_ids.append(cli['person_id'])
+                client_ids.append(cli['person_id'])
                 self.client_embeddings_map[cli['person_id']] = embedding
 
             if client_embeddings:
                 client_embeddings = np.array(client_embeddings)
                 faiss.normalize_L2(client_embeddings)  # Ensure normalization
-                self.faiss_index_client.add(client_embeddings) # noqa
+                self.faiss_index_client.add_with_ids(client_embeddings, np.array(client_ids))
                 Config.logger.info(f"Loaded {len(client_embeddings)} client embeddings into Faiss index.")
             else:
                 Config.logger.warning("No client embeddings loaded into Faiss index.")
 
     def add_employee_embedding(self, person_id, embedding):
-        with self.lock: # noqa
+        with self.lock:
             norm = np.linalg.norm(embedding)
             if norm == 0:
                 Config.logger.error(f"Cannot add employee {person_id} with zero norm embedding.")
@@ -203,8 +200,10 @@ class DatabaseManager:
                 }},
                 upsert=True
             )
-            self.faiss_index_employee.add(np.array([embedding]).astype('float32')) # noqa
-            self.employee_ids.append(person_id)
+            self.faiss_index_employee.add_with_ids(
+                np.array([embedding]).astype('float32'),
+                np.array([person_id], dtype='int64')
+            )
             self.employee_embeddings_map[person_id] = embedding
             Config.logger.info(f"Stored/Updated embedding for Employee ID: {person_id}")
 
@@ -223,41 +222,32 @@ class DatabaseManager:
                 }},
                 upsert=True
             )
-            self.faiss_index_client.add(np.array([embedding]).astype('float32')) # noqa
-            self.client_ids.append(person_id)
+            self.faiss_index_client.add_with_ids(
+                np.array([embedding]).astype('float32'),
+                np.array([person_id], dtype='int64')
+            )
             self.client_embeddings_map[person_id] = embedding
             Config.logger.info(f"Stored/Updated embedding for Client ID: {person_id}")
 
     def remove_employee_embedding(self, person_id):
         with self.lock:
             self.employees_collection.delete_one({"person_id": person_id})
-            if person_id in self.employee_ids:
-                self.employee_ids.remove(person_id)
-                Config.logger.info(f"Removed Employee ID: {person_id}")
-            else:
-                Config.logger.warning(f"Employee ID {person_id} not found in employee IDs.")
-            if person_id in self.employee_embeddings_map:
-                self.employee_embeddings_map.pop(person_id, None)
+            self.employee_embeddings_map.pop(person_id, None)
+            try:
+                self.faiss_index_employee.remove_ids(np.array([person_id], dtype='int64'))
+                Config.logger.info(f"Removed embedding for Employee ID: {person_id}")
+            except Exception as e:
+                Config.logger.error(f"Error removing embedding from Faiss index: {e}")
 
     def remove_client_embedding(self, person_id):
         with self.lock:
-            Config.logger.info(f"Before removing client from faiss index: {self.client_ids}")
-
-            # Attempt to retrieve the index of the client ID before deletion
-            if person_id in self.client_ids:
-                index = self.client_ids.index(person_id)
-                self.clients_collection.delete_one({"person_id": person_id})
-                self.client_ids.remove(person_id)
-                self.client_embeddings_map.pop(person_id, None)
-
-                # Remove from Faiss index using the index
-                try:
-                    self.faiss_index_client.remove_ids(np.array([index]))
-                    Config.logger.info(f"Removed embedding for Client ID: {person_id}")
-                except Exception as e:
-                    Config.logger.error(f"Error removing embedding from Faiss index: {e}")
-            else:
-                Config.logger.warning(f"Client ID {person_id} not found in client IDs.")
+            self.clients_collection.delete_one({"person_id": person_id})
+            self.client_embeddings_map.pop(person_id, None)
+            try:
+                self.faiss_index_client.remove_ids(np.array([person_id], dtype='int64'))
+                Config.logger.info(f"Removed embedding for Client ID: {person_id}")
+            except Exception as e:
+                Config.logger.error(f"Error removing embedding from Faiss index: {e}")
 
     def remove_deleted_employees(self, fetched_employee_ids):
         with self.lock:
@@ -291,24 +281,15 @@ class DatabaseManager:
         with self.lock:
             if self.faiss_index_employee.ntotal == 0:
                 return None, 0
-            D, I = self.faiss_index_employee.search(np.array([embedding]).astype('float32'), k=1) # noqa
+            D, I = self.faiss_index_employee.search(np.array([embedding]).astype('float32'), k=1)
             if I[0][0] == -1:
                 return None, 0
             similarity = float(D[0][0])  # Cosine similarity
             similarity = min(max(similarity, -1.0), 1.0)  # Cap similarity
             Config.logger.debug(f"Faiss similarity: {similarity}")
             if similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
-                employee_id = self.employee_ids[I[0][0]]
+                employee_id = int(I[0][0])
                 employee = self.employees_collection.find_one({"person_id": employee_id})
-                # Verify using compute_sim
-                matched_embedding = self.employee_embeddings_map.get(employee_id)
-                if matched_embedding is not None:
-                    computed_similarity = compute_sim(tuple(embedding), tuple(matched_embedding))
-                    if computed_similarity is not None:
-                        computed_similarity = min(max(computed_similarity, -1.0), 1.0)
-                        Config.logger.debug(f"Computed similarity for Employee ID {employee_id}: {computed_similarity}")
-                        if computed_similarity > Config.EMPLOYEE_SIMILARITY_THRESHOLD:
-                            return employee, computed_similarity
                 return employee, similarity
             return None, 0
 
@@ -316,24 +297,15 @@ class DatabaseManager:
         with self.lock:
             if self.faiss_index_client.ntotal == 0:
                 return None, 0
-            D, I = self.faiss_index_client.search(np.array([embedding]).astype('float32'), k=1) # noqa
+            D, I = self.faiss_index_client.search(np.array([embedding]).astype('float32'), k=1)
             if I[0][0] == -1:
                 return None, 0
             similarity = float(D[0][0])  # Cosine similarity
             similarity = min(max(similarity, -1.0), 1.0)  # Cap similarity
             Config.logger.debug(f"Faiss similarity: {similarity}")
             if similarity > Config.CHECK_NEW_CLIENT:
-                client_id = self.client_ids[I[0][0]]
+                client_id = int(I[0][0])
                 client = self.clients_collection.find_one({"person_id": client_id})
-                # Verify using compute_sim
-                matched_embedding = self.client_embeddings_map.get(client_id)
-                if matched_embedding is not None:
-                    computed_similarity = compute_sim(tuple(embedding), tuple(matched_embedding))
-                    if computed_similarity is not None:
-                        computed_similarity = min(max(computed_similarity, -1.0), 1.0)
-                        Config.logger.debug(f"Computed similarity for Client ID {client_id}: {computed_similarity}")
-                        if computed_similarity > Config.CHECK_NEW_CLIENT:
-                            return client, computed_similarity
                 return client, similarity
             return None, 0
 
@@ -341,8 +313,8 @@ class DatabaseManager:
 class FaceProcessor:
     def __init__(self):
         # Initialize FaceAnalysis with desired models
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])  # Use CPU only
-        self.app.prepare(ctx_id=-1, det_size=Config.DET_SIZE)
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])  # Use CUDA if available
+        self.app.prepare(ctx_id=0, det_size=Config.DET_SIZE)
 
     def get_embedding_from_image(self, image):
         faces = self.app.get(image)
@@ -466,9 +438,9 @@ def send_report_json(endpoint, data=None, headers=None):
     except requests.RequestException as e:
         # Attempt to log the response content for detailed error information
         try:
-            error_content = response.json() # noqa
+            error_content = response.json()
             Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}, Response: {error_content}")
-        except Exception as e:
+        except Exception:
             Config.logger.error(f"Failed to send JSON report to {endpoint}: {e}")
         return None
 
@@ -537,7 +509,7 @@ def process_image(file_path, camera_id, db_manager, face_processor, employee_las
                     employee_last_report_times[person_id] = current_time
                     return
 
-        # After matching a client
+        # Search for matching client
         client, similarity_cli = db_manager.find_matching_client(embedding)
         if client:
             person_id = client['person_id']
@@ -558,15 +530,6 @@ def process_image(file_path, camera_id, db_manager, face_processor, employee_las
                     client_last_report_times[person_id] = current_time
                     Config.logger.info(f"Client {person_id} visited with similarity {similarity_cli}")
             return
-
-
-            # update_client_via_api(
-            #     client_id=client['person_id'],
-            #     datetime_str=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            #     device_id=camera_id
-            # )
-            # logging.info(f"Client {client['person_id']} visited with similarity {similarity_cli}")
-            # return
 
         # If no match found, create new client
         new_client_id = create_client_via_api(
@@ -631,28 +594,8 @@ def fetch_and_store_data(db_manager, face_processor):
             image_url = f"{Config.API_BASE_URL}/{client['image']}"
             embedding = get_embedding_from_url(image_url, face_processor)
             if embedding is not None:
-                if db_manager.clients_collection.find_one({"person_id": client['id']}):
-                    # Update existing client
-                    db_manager.clients_collection.update_one(
-                        {"person_id": client['id']},
-                        {"$set": {
-                            "embedding": embedding.tolist(),
-                            "first_seen": client.get('first_seen'),
-                            "last_seen": client.get('last_seen'),
-                            "visit_count": client.get('visit_count', 1),
-                            "gender": client.get('gender'),
-                            "age": client.get('age'),
-                            "updated_at": datetime.now()
-                        }},
-                        upsert=True
-                    )
-                    # Update embedding mapping
-                    db_manager.client_embeddings_map[client['id']] = embedding
-                    Config.logger.info(f"Updated embedding for Client ID: {client['id']}")
-                else:
-                    # Create new client
-                    db_manager.add_client_embedding(client['id'], embedding)
-                    Config.logger.info(f"Stored new embedding for Client ID: {client['id']}")
+                db_manager.add_client_embedding(client['id'], embedding)
+                Config.logger.info(f"Stored/Updated embedding for Client ID: {client['id']}")
             else:
                 Config.logger.error(f"Failed to get embedding for Client ID: {client['id']}")
 
